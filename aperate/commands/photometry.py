@@ -2,6 +2,7 @@
 
 import gc
 import logging
+import multiprocessing as mp
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -941,6 +942,97 @@ def process_photometry_for_filter(ctx: PhotometryContext, filter_name: str) -> T
     return ctx.catalog
 
 
+def process_photometry_tile(project_dir, tile, filters_to_process, config, images_config, photometry_config, psfs_config, overwrite):
+    """Process photometry for a single tile."""
+    logger = get_logger()
+    
+    logger.info(f"Processing tile [bold cyan]{tile}[/bold cyan]")
+    
+    try:
+        # Load detection catalog for this tile
+        catalog, windowed = load_tile_catalog(project_dir, config.name, tile)
+        if catalog is None:
+            logger.warning(f"No detection catalog found for tile {tile}, skipping")
+            return False
+        
+        logger.info(f"    Loaded catalog with {len(catalog)} sources")
+        
+        # Validate catalog has required position columns
+        validate_catalog_positions(catalog, windowed)
+        
+        # Load segmentation map (per-tile, shared across filters)
+        segmap = load_segmentation_map(images_config, tile)
+        segmap = segmap.astype(segmap.dtype.newbyteorder('='))
+        if segmap is None:
+            logger.warning(f"No segmentation map found for tile {tile}, skipping")
+            return False
+        
+        # Create photometry context for this tile
+        ctx = PhotometryContext(
+            catalog=catalog,
+            segmap=segmap,
+            tile=tile,
+            images_config=images_config,
+            photometry_config=photometry_config,
+            psfs_config=psfs_config,
+            main_config=config,
+            windowed=windowed,
+            overwrite=overwrite
+        )
+
+        # Process each filter
+        for filter_name in filters_to_process:
+            logger.info(f"    [bold cyan]{tile}[/bold cyan]: Processing filter [bold cyan]{filter_name}[/bold cyan]")
+            
+            # Check if this filter/tile combination exists
+            if not ctx.images_config.filter_tile_exists(filter_name, tile):
+                logger.warning(f"    Filter {filter_name} not available for tile {tile}, skipping")
+                continue
+            
+            # Run photometry functions for this filter
+            ctx.catalog = process_photometry_for_filter(ctx, filter_name)
+        
+        # Apply Kron correction after all filters processed
+        if ctx.photometry_config.auto.run and ctx.photometry_config.auto.kron_corr:
+            logger.info("  Applying Kron correction to AUTO photometry")
+            apply_kron_corr(
+                ctx,
+                ctx.photometry_config.auto.kron_corr_filter,
+                ctx.photometry_config.auto.kron_params,
+                ctx.photometry_config.auto.kron_corr_params,
+                ctx.photometry_config.auto.kron_corr_bounds
+            )
+        
+        # Apply aperture correction after all filters processed
+        if ctx.photometry_config.aperture.run_psf_homogenized and ctx.photometry_config.aperture.aper_corr:
+            logger.info("  Applying aperture correction to PSF-homogenized aperture photometry")
+            apply_aper_corr(
+                ctx,
+                ctx.photometry_config.aperture.aper_corr_filter,
+                ctx.photometry_config.aperture.aper_corr_params,
+                ctx.photometry_config.aperture.aper_corr_bounds,
+                ctx.photometry_config.aperture.diameters
+            )
+        
+        # Save updated catalog
+        save_tile_catalog(project_dir, config.name, tile, ctx.catalog)
+        
+        # Force garbage collection after tile processing
+        gc.collect()
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error processing tile {tile}: {str(e)}")
+        return False
+
+
+def process_photometry_tile_wrapper(args):
+    """Wrapper function for multiprocessing."""
+    project_dir, tile, filters_to_process, config, images_config, photometry_config, psfs_config, overwrite = args
+    return process_photometry_tile(project_dir, tile, filters_to_process, config, images_config, photometry_config, psfs_config, overwrite)
+
+
 @click.command("photometry")
 @click.option(
     "--project-dir", 
@@ -970,7 +1062,13 @@ def process_photometry_for_filter(ctx: PhotometryContext, filter_name: str) -> T
     is_flag=True,
     help="Enable debug output"
 )
-def photometry_cmd(project_dir, tiles, filters, overwrite, verbose):
+@click.option(
+    "--parallel",
+    type=int,
+    default=1,
+    help="Number of parallel processes (default: 1, no parallelization)"
+)
+def photometry_cmd(project_dir, tiles, filters, overwrite, verbose, parallel):
     """Perform aperture photometry measurements."""
     logger = get_logger()
     
@@ -1043,92 +1141,24 @@ def photometry_cmd(project_dir, tiles, filters, overwrite, verbose):
     if photometry_config.auto.run:
         logger.info(f"  Kron parameters: {photometry_config.auto.kron_params}")
     
-    # Process each tile
-    successful_tiles = []
-    
-    for tile in tiles_to_process:
-        logger.info(f"Processing tile [bold cyan]{tile}[/bold cyan]")
+    # Process tiles
+    if parallel > 1 and len(tiles_to_process) > 1:
+        logger.info(f"Processing {len(tiles_to_process)} tiles using {parallel} processes")
+        # Prepare tasks for multiprocessing
+        tasks = [(project_dir, tile, filters_to_process, config, images_config, photometry_config, psfs_config, overwrite) 
+                 for tile in tiles_to_process]
         
-        try:
-            # Load detection catalog for this tile
-            catalog, windowed = load_tile_catalog(project_dir, config.name, tile)
-            if catalog is None:
-                logger.warning(f"No detection catalog found for tile {tile}, skipping")
-                continue
-            
-            logger.info(f"    Loaded catalog with {len(catalog)} sources")
-            
-            # Validate catalog has required position columns
-            validate_catalog_positions(catalog, windowed)
-            
-            # Load segmentation map (per-tile, shared across filters)
-            segmap = load_segmentation_map(images_config, tile)
-            segmap = segmap.astype(segmap.dtype.newbyteorder('='))
-            if segmap is None:
-                logger.warning(f"No segmentation map found for tile {tile}, skipping")
-                continue
-            
-            # Create photometry context for this tile
-            ctx = PhotometryContext(
-                catalog=catalog,
-                segmap=segmap,
-                tile=tile,
-                images_config=images_config,
-                photometry_config=photometry_config,
-                psfs_config=psfs_config,
-                main_config=config,
-                windowed=windowed,
-                overwrite=overwrite
-            )
-
-            # Process each filter
-            for filter_name in filters_to_process:
-                logger.info(f"    [bold cyan]{tile}[/bold cyan]: Processing filter [bold cyan]{filter_name}[/bold cyan]")
-                
-                # Check if this filter/tile combination exists
-                if not ctx.images_config.filter_tile_exists(filter_name, tile):
-                    logger.warning(f"    Filter {filter_name} not available for tile {tile}, skipping")
-                    continue
-                
-                # Run photometry functions for this filter
-                ctx.catalog = process_photometry_for_filter(ctx, filter_name)
-            
-            # Apply Kron correction after all filters processed
-            if ctx.photometry_config.auto.run and ctx.photometry_config.auto.kron_corr:
-                logger.info("  Applying Kron correction to AUTO photometry")
-                apply_kron_corr(
-                    ctx,
-                    ctx.photometry_config.auto.kron_corr_filter,
-                    ctx.photometry_config.auto.kron_params,
-                    ctx.photometry_config.auto.kron_corr_params,
-                    ctx.photometry_config.auto.kron_corr_bounds
-                )
-            
-            # Apply aperture correction after all filters processed
-            if ctx.photometry_config.aperture.run_psf_homogenized and ctx.photometry_config.aperture.aper_corr:
-                logger.info("  Applying aperture correction to PSF-homogenized aperture photometry")
-                apply_aper_corr(
-                    ctx,
-                    ctx.photometry_config.aperture.aper_corr_filter,
-                    ctx.photometry_config.aperture.aper_corr_params,
-                    ctx.photometry_config.aperture.aper_corr_bounds,
-                    ctx.photometry_config.aperture.diameters
-                )
-            
-            # Save updated catalog
-            save_tile_catalog(project_dir, config.name, tile, ctx.catalog)
-            successful_tiles.append(tile)
-            
-            # Force garbage collection after each tile
-            gc.collect()
-            
-        except Exception as e:
-            logger.error(f"Error processing tile {tile}: {str(e)}")
-            if len(tiles_to_process) == 1:
-                raise
-            else:
-                logger.warning("Continuing with remaining tiles...")
-                continue
+        with mp.Pool(processes=parallel) as pool:
+            results = pool.map(process_photometry_tile_wrapper, tasks)
+        
+        successful_tiles = [tile for tile, success in zip(tiles_to_process, results) if success]
+    else:
+        # Sequential processing
+        successful_tiles = []
+        for tile in tiles_to_process:
+            success = process_photometry_tile(project_dir, tile, filters_to_process, config, images_config, photometry_config, psfs_config, overwrite)
+            if success:
+                successful_tiles.append(tile)
     
     # Summary
     if successful_tiles:

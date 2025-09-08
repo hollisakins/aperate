@@ -2,6 +2,7 @@
 
 import gc
 import logging
+import multiprocessing as mp
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -940,6 +941,109 @@ def compute_windowed_positions(detec, segmap, objs):
     return objs
 
 
+def process_detection_tile(project_dir, tile, build_config, source_config, config_name, overwrite):
+    """Process a single tile for detection."""
+    logger = get_logger()
+    
+    logger.info(f"Processing tile [bold cyan]{tile}[/bold cyan]")
+    
+    try:
+        # Step 1: Build detection image
+        detection_image_path = build_detection_image_for_tile(
+            project_dir, tile, build_config, overwrite
+        )
+        
+        if detection_image_path is None:
+            logger.warning(f"Skipping tile {tile} due to detection image failure")
+            return False
+        
+        # Step 2: Run source detection
+        objs, segmap = detect_sources_in_tile(
+            detection_image_path, source_config, project_dir, tile, config_name, overwrite
+        )
+        
+        if objs is None:
+            logger.warning(f"Skipping tile {tile} due to source detection failure")
+            return False
+        
+        logger.info(f"    Processing {len(objs)} sources for {tile}")
+
+        # If we don't have kronrad (i.e., we created a fresh catalog instead of loading an existing one)
+        if 'kronrad' not in objs.columns:
+            with fits.open(detection_image_path) as hdul:
+                detec = hdul[1].data / hdul[2].data
+                header = hdul[1].header
+                wcs = WCS(header)
+
+            # Compute the kron radius
+            logger.info(f"    Computing kron radius")
+            compute_kron_radius(detec, segmap, objs, windowed=False)
+
+            # Compute windowed positions if requested
+            if source_config.windowed_positions:
+                logger.info(f"    Computing windowed positions")
+                compute_windowed_positions(detec, segmap, objs)
+                # Recompute kron radius using new windowed positions
+                logger.info(f"    Re-computing kron radius")
+                compute_kron_radius(detec, segmap, objs, windowed=True)
+            
+            # Add RA/Dec coordinates
+            if source_config.windowed_positions:
+                coords = wcs.pixel_to_world(objs['xwin'], objs['ywin'])
+            else:
+                coords = wcs.pixel_to_world(objs['x'], objs['y'])
+            ra = coords.ra.value
+            dec = coords.dec.value
+            objs['ra'] = ra
+            objs['dec'] = dec
+
+        if source_config.plot:
+            plot_path = detection_image_path.with_suffix('.pdf')
+            if not plot_path.exists() or overwrite:
+                logger.info(f"    Plotting detections")
+                
+                with fits.open(detection_image_path) as hdul:
+                    detec = hdul[1].data / hdul[2].data
+                    header = hdul[1].header
+                    wcs = WCS(header)
+
+                plot_detections(detec, segmap, objs, plot_path, windowed=source_config.windowed_positions)
+
+        # Step 3: Create catalog
+        catalog_path = project_dir / "catalogs" / f"catalog_{config_name}_{tile}.fits"
+        
+        if not catalog_path.exists() or overwrite:
+            metadata = {
+                'dettype': build_config.type,
+                'detschem': source_config.scheme,
+            }
+            if source_config.scheme == "master":
+                metadata.update({
+                    'detfilte': build_config.filters[0] if build_config.filters else 'unknown',
+                })
+            
+            # Save catalog
+            catalog_path.parent.mkdir(parents=True, exist_ok=True)
+            objs.meta = metadata
+            objs.write(catalog_path, format='fits', overwrite=True)
+            logger.info(f"    Saved catalog with {len(objs)} sources to {catalog_path}")
+        
+        # Force garbage collection after each tile
+        gc.collect()
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error processing tile {tile}: {str(e)}")
+        return False
+
+
+def process_detection_tile_wrapper(args):
+    """Wrapper function for multiprocessing."""
+    project_dir, tile, build_config, source_config, config_name, overwrite = args
+    return process_detection_tile(project_dir, tile, build_config, source_config, config_name, overwrite)
+
+
 @click.command("detect")
 @click.option(
     "--project-dir", 
@@ -963,7 +1067,13 @@ def compute_windowed_positions(detec, segmap, objs):
     is_flag=True,
     help="Enable debug output"
 )
-def detect_cmd(project_dir, tiles, overwrite, verbose):
+@click.option(
+    "--parallel",
+    type=int,
+    default=1,
+    help="Number of parallel processes (default: 1, no parallelization)"
+)
+def detect_cmd(project_dir, tiles, overwrite, verbose, parallel):
     """Build detection images and detect sources."""
     logger = get_logger()
     
@@ -1027,116 +1137,24 @@ def detect_cmd(project_dir, tiles, overwrite, verbose):
         else:
             logger.warning("psfs.toml not found - homogenized images may not be available")
     
-    # Process each tile
-    successful_tiles = []
-    
-    for tile in tiles_to_process:
-        logger.info(f"Processing tile [bold cyan]{tile}[/bold cyan]")
+    # Process tiles
+    if parallel > 1 and len(tiles_to_process) > 1:
+        logger.info(f"Processing {len(tiles_to_process)} tiles using {parallel} processes")
+        # Prepare tasks for multiprocessing
+        tasks = [(project_dir, tile, build_config, source_config, config.name, overwrite) 
+                 for tile in tiles_to_process]
         
-        try:
-            # Step 1: Build detection image
-            detection_image_path = build_detection_image_for_tile(
-                project_dir, tile, build_config, overwrite
-            )
-            
-            if detection_image_path is None:
-                logger.warning(f"Skipping tile {tile} due to detection image failure")
-                continue
-            
-            # Step 2: Run source detection
-            objs, segmap = detect_sources_in_tile(
-                detection_image_path, source_config, project_dir, tile, config.name, overwrite
-            )
-            
-            if objs is None:
-                logger.warning(f"Skipping tile {tile} due to source detection failure")
-                continue
-            
-
-            logger.info(f"    Processing {len(objs)} sources for {tile}")
-
-            # If we don't have kronrad (i.e., we created a fresh catalog instead of loading an existing one) 
-            if 'kronrad' not in objs.columns:
-
-                with fits.open(detection_image_path) as hdul:
-                    detec = hdul[1].data / hdul[2].data
-                    header = hdul[1].header
-                    wcs = WCS(header)
-
-                # Compute the kron radius
-                logger.info(f"    Computing kron radius")
-                compute_kron_radius(detec, segmap, objs, windowed = False)
-
-                # Compute windowed positions if requested
-                if source_config.windowed_positions:
-                    logger.info(f"    Computing windowed positions")
-                    compute_windowed_positions(detec, segmap, objs)
-                    # Recompute kron radius using new windowed positions
-                    logger.info(f"    Re-computing kron radius")
-                    compute_kron_radius(detec, segmap, objs, windowed = True)
-                
-                # Add RA/Dec coordinates
-                if source_config.windowed_positions:
-                    coords = wcs.pixel_to_world(objs['xwin'], objs['ywin'])
-                else:
-                    coords = wcs.pixel_to_world(objs['x'], objs['y'])
-                ra = coords.ra.value
-                dec = coords.dec.value
-                objs['ra'] = ra
-                objs['dec'] = dec
-
-
-            if source_config.plot: 
-                plot_path = detection_image_path.with_suffix('.pdf')
-                if not plot_path.exists() or overwrite:
-                    logger.info(f"    Plotting detections")
-                    
-                    with fits.open(detection_image_path) as hdul:
-                        detec = hdul[1].data / hdul[2].data
-                        header = hdul[1].header
-                        wcs = WCS(header)
-
-                    plot_detections(detec, segmap, objs, plot_path, windowed=source_config.windowed_positions)
-
-
-            # Step 3: Create catalog (only if we ran detection or overwriting)
-            catalog_path = project_dir / "catalogs" / f"catalog_{config.name}_{tile}.fits"
-            
-            if not catalog_path.exists() or overwrite:
-                metadata = {
-                    'dettype': build_config.type,
-                    'detschem': source_config.scheme,
-                    'detfilt': ','.join(build_config.filters),
-                    'dethom': build_config.homogenized,
-                    'windowed': source_config.windowed_positions
-                }
-                
-                catalog_path = create_tile_catalog(
-                    project_dir, config.name, tile, objs, metadata
-                )
-            else:
-                # Check if existing catalog needs metadata updates
-                needs_metadata_update = check_catalog_metadata_completeness(
-                    catalog_path, source_config, build_config
-                )
-                if needs_metadata_update:
-                    logger.info(f"    Updating catalog metadata for {tile}")
-                    update_catalog_metadata(catalog_path, source_config, build_config, config.name, tile)
-                else:
-                    logger.debug(f"    Using existing catalog with up-to-date metadata: {catalog_path}")
-            
-            successful_tiles.append(tile)
-            
-            # Force garbage collection after each tile
-            gc.collect()
-            
-        except Exception as e:
-            logger.error(f"Error processing tile {tile}: {str(e)}")
-            if len(tiles_to_process) == 1:
-                raise
-            else:
-                logger.warning("Continuing with remaining tiles...")
-                continue
+        with mp.Pool(processes=parallel) as pool:
+            results = pool.map(process_detection_tile_wrapper, tasks)
+        
+        successful_tiles = [tile for tile, success in zip(tiles_to_process, results) if success]
+    else:
+        # Sequential processing
+        successful_tiles = []
+        for tile in tiles_to_process:
+            success = process_detection_tile(project_dir, tile, build_config, source_config, config.name, overwrite)
+            if success:
+                successful_tiles.append(tile)
     
     # Update images.toml with detection image and segmap paths
     if successful_tiles:

@@ -2,10 +2,11 @@
 
 import gc
 import logging
+import multiprocessing as mp
 import warnings
 import time 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import click
 import numpy as np
@@ -211,6 +212,22 @@ def homogenize_filter_tile(
         return False
 
 
+def homogenize_filter_tile_wrapper(args):
+    """Wrapper function for multiprocessing."""
+    project_dir, filter_name, tile, target_filter, is_inverse, master_psf, reg_fact, overwrite, output_prefix = args
+    return homogenize_filter_tile(
+        project_dir=project_dir,
+        filter_name=filter_name,
+        tile=tile,
+        target_filter=target_filter,
+        is_inverse=is_inverse,
+        master_psf=master_psf,
+        reg_fact=reg_fact,
+        overwrite=overwrite,
+        output_prefix=output_prefix
+    )
+
+
 @click.command("homogenize")
 @click.option(
     "--project-dir", 
@@ -245,7 +262,13 @@ def homogenize_filter_tile(
     is_flag=True,
     help="Enable debug output"
 )
-def homogenize_cmd(project_dir, filters, tiles, overwrite, target_filter, verbose):
+@click.option(
+    "--parallel",
+    type=int,
+    default=1,
+    help="Number of parallel processes (default: 1, no parallelization)"
+)
+def homogenize_cmd(project_dir, filters, tiles, overwrite, target_filter, verbose, parallel):
     """Homogenize PSF models to a target filter."""
     logger = get_logger()
     
@@ -370,6 +393,8 @@ def homogenize_cmd(project_dir, filters, tiles, overwrite, target_filter, verbos
     if len(filters_to_process)>1:
         logger.info(f"Processing {len(filters_to_process)} filters...")
     
+    # Collect all filter-tile combinations
+    tasks = []
     for filter_name in filters_to_process:
         # Get tiles for this filter
         filter_tiles = images_config.get_tiles_for_filter(filter_name)
@@ -386,27 +411,39 @@ def homogenize_cmd(project_dir, filters, tiles, overwrite, target_filter, verbos
         
         is_inverse = filter_name in inverse_filters
         
-        # Process each tile
+        # Collect tasks for this filter
         for tile in filter_tiles:
+            tasks.append((
+                project_dir,
+                filter_name,
+                tile,
+                target_filter,
+                is_inverse,
+                config.psf_generation.master_psf,
+                config.psf_homogenization.reg_fact,
+                overwrite,
+                config.psf_homogenization.output_prefix
+            ))
+    
+    # Process tasks
+    if parallel > 1 and len(tasks) > 1:
+        logger.info(f"Processing {len(tasks)} filter-tile combinations using {parallel} processes")
+        with mp.Pool(processes=parallel) as pool:
+            results = pool.map(homogenize_filter_tile_wrapper, tasks)
+    else:
+        # Sequential processing
+        results = []
+        for task in tasks:
             try:
-                success = homogenize_filter_tile(
-                    project_dir=project_dir,
-                    filter_name=filter_name,
-                    tile=tile,
-                    target_filter=target_filter,
-                    is_inverse=is_inverse,
-                    master_psf=config.psf_generation.master_psf,
-                    reg_fact=config.psf_homogenization.reg_fact,
-                    overwrite=overwrite,
-                    output_prefix=config.psf_homogenization.output_prefix
-                )
-                
+                success = homogenize_filter_tile(*task)
+                results.append(success)
                 # Force garbage collection after each tile
                 gc.collect()
-                
             except Exception as e:
+                filter_name, tile = task[1], task[2]
                 logger.error(f"Error processing {filter_name}-{tile}: {str(e)}")
-                if len(filter_tiles) == 1:
+                results.append(False)
+                if len(tasks) == 1:
                     raise
                 else:
                     logger.warning("Continuing with remaining tiles...")
