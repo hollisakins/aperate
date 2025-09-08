@@ -1,0 +1,2 @@
+[console_scripts]
+aperate = aperate.cli:main

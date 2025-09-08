@@ -1,0 +1,132 @@
+# Example config.toml file -- based on COSMOS data
+name = 'cosmos_v1.0'
+
+# Images can be broken down into tiles, which cataloged separately and merged in the final stages
+tiles = ['B1','B2','B3','B4','B5','B6','B7','B8','B9','B10','A1','A2','A3','A4','A5','A6','A7','A8','A9','A10']
+
+# Filters to include in the catalog (list of str, lowercase)
+filters = ['f606w', 'f814w', 'f090w', 'f115w', 'f140m', 'f150w', 'f182m', 'f200w', 'f210m', 'f250m', 'f277w', 'f335m', 'f356w', 'f360m', 'f410m', 'f430m', 'f444w', 'f460m', 'f480m']
+
+# Final output flux units
+flux_unit = 'uJy'
+
+# Global settings
+plot = true
+checkplots = true
+
+##########################################################################################
+# Data source specifications with explicit templates
+[data]
+base_path = '/V/hugh/mosaics/cosmos'
+
+[data.hst_acs1]
+filters = ['f606w']
+extensions = ['drz', 'wht']
+extension_mapping = {drz = 'sci', wht = 'wht'}
+filename = '{filter}/mosaic_cosmos_all_hst_acs_wfc_{filter}_30mas_tile_{tile}_v0.3_{ext}.fits'
+
+[data.hst_acs2]
+filters = ['f814w']
+extensions = ['drz', 'wht']
+extension_mapping = {drz = 'sci', wht = 'wht'}
+filename = '{filter}/mosaic_cosmos_web_30mas_tile_{tile}_hst_acs_wfc_{filter}_{ext}.fits'
+
+[data.jwst_nircam]
+filters = ['f090w','f115w','f140m','f150w','f182m','f200w','f210m','f250m','f277w','f335m','f360m','f356w','f410m','f430m','f444w','f460m','f480m']
+extensions = ['sci', 'err', 'wht']
+filename = '{filter}/mosaic_nircam_{filter}_cosmos_30mas_v0p7_{tile}_{ext}.fits'
+
+##########################################################################################
+# Pipeline step configurations
+
+[steps.psf_generation]
+    master_psf = true     # Create (and use) master PSF by combining all tiles
+    min_snr = 75          # Minimum SNR for star selection
+    max_snr = 1000        # Maximum SNR for star selection
+    max_ellip = 0.1       # Maximum ellipticity for star selection
+    psf_size = 151        # PSF array size (pixels)
+    az_average = true     # Azimuthally average PSFs
+    checkplots = true
+
+    # Filter-specific FWHM constraints (arcsec)
+    [steps.psf_generation.filter_params]
+    f606w = {fwhm_min=3.0, fwhm_max=5.0}
+    f814w = {fwhm_min=4.0, fwhm_max=5.0}
+    f090w = {fwhm_min=2.0, fwhm_max=3.15}
+    f115w = {fwhm_min=2.0, fwhm_max=3.15}
+    f150w = {fwhm_min=2.0, fwhm_max=3.25}
+    f277w = {fwhm_min=4.0, fwhm_max=5.5}
+    f444w = {fwhm_min=5.25, fwhm_max=6.75}
+
+[steps.psf_homogenization]
+    target_filter = 'f444w'               # Filter to homogenize to
+    inverse_filters = ['f480m']           # Filters with larger PSF than target
+    reg_fact = 3e-3                       # Regularization factor for kernels
+
+[steps.build_detection_image]
+
+    type = 'ivw'              # Detection image method
+    filters = ['f182m','f200w','f210m','f250m','f277w','f335m','f356w','f410m','f444w','f480m']
+    homogenized = true     # Use PSF-homogenized images
+
+
+[steps.detection]
+    
+    scheme = 'hot+cold'     # Two-stage detection scheme
+    cold_mask_dilate_size = 5
+    windowed_positions = true            # Use windowed centroids
+
+    [steps.detection.cold]
+        thresh = 3.0
+        minarea = 25
+        deblend_nthresh = 32
+        deblend_cont = 0.01
+        kernel_type = 'tophat'
+        kernel_params = {radius=4.5}
+        filter_type = 'matched'
+        clean = true
+        clean_param = 2.0
+    
+    [steps.detection.hot]
+        thresh = 2.0
+        minarea = 8
+        deblend_nthresh = 32
+        deblend_cont = 0.001
+        kernel_type = 'gaussian'
+        kernel_params = {fwhm=3, size=9}
+        filter_type = 'matched'
+        clean = true
+        clean_param = 0.5
+
+[steps.photometry]
+    compute_rhalf = true
+    
+    [steps.photometry.aperture]
+        run_native = true                 # Measure on native PSF images
+        run_psf_homogenized = true       # Measure on PSF-homogenized images
+        diameters = [0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]  # arcsec
+    
+    [steps.photometry.auto]
+        run = true
+        kron_params = [1.1, 1.6]
+        kron_corr = true
+        kron_corr_filter = 'f277w'
+        kron_corr_thresh = 3
+        kron_corr_params = [2.5, 3.5]
+
+[steps.postprocess]
+    
+    [steps.postprocess.merge_tiles]
+        run = true
+        matching_radius = 0.1            # arcsec
+        edge_mask = 300                  # pixels
+    
+    [steps.postprocess.random_apertures]
+        run = true
+        min_radius = 0.05               # arcsec
+        max_radius = 1.50               # arcsec
+        num_radii = 40
+        num_apertures_per_sq_arcmin = 100
+    
+    [steps.postprocess.psf_corrections]
+        run = true
