@@ -1016,17 +1016,17 @@ def process_detection_tile(project_dir, tile, build_config, source_config, confi
             metadata = {
                 'dettype': build_config.type,
                 'detschem': source_config.scheme,
+                'windowed': source_config.windowed_positions
             }
             if source_config.scheme == "master":
                 metadata.update({
                     'detfilte': build_config.filters[0] if build_config.filters else 'unknown',
                 })
             
-            # Save catalog
-            catalog_path.parent.mkdir(parents=True, exist_ok=True)
-            objs.meta = metadata
-            objs.write(catalog_path, format='fits', overwrite=True)
-            logger.info(f"    Saved catalog with {len(objs)} sources to {catalog_path}")
+            # Create catalog with proper extension naming
+            catalog_path = create_tile_catalog(
+                project_dir, config_name, tile, objs, metadata
+            )
         
         # Force garbage collection after each tile
         gc.collect()
