@@ -1,8 +1,10 @@
 """TOML configuration file parsing and validation."""
 
+import os
 import sys
 from pathlib import Path
 from typing import Dict, Any
+from astropy.io import fits
 
 # Handle tomli import for different Python versions
 if sys.version_info >= (3, 11):
@@ -38,10 +40,40 @@ def load_config(config_path: Path) -> AperateConfig:
         config = AperateConfig.from_dict(config_data)
         config.validate()
         logger.info("Config validation successful")
+        
+        # Apply performance settings (environment variable takes precedence)
+        apply_performance_config(config)
+        
         return config
     except Exception as e:
         print_error(f"Config validation failed: {e}")
         raise
+
+
+def apply_performance_config(config: AperateConfig) -> None:
+    """
+    Apply performance configuration settings.
+    Environment variable APERATE_MEMMAP takes precedence over config file.
+    """
+    logger = get_logger()
+    
+    # Check environment variable first (takes precedence)
+    memmap_env = os.environ.get('APERATE_MEMMAP')
+    if memmap_env is not None:
+        # Environment variable overrides config
+        if memmap_env == '0':
+            fits.Conf.use_memmap = False
+            logger.debug("Memory mapping disabled via APERATE_MEMMAP=0")
+        else:
+            fits.Conf.use_memmap = True
+            logger.debug(f"Memory mapping enabled via APERATE_MEMMAP={memmap_env}")
+    else:
+        # Use config file setting
+        fits.Conf.use_memmap = config.performance.memmap
+        if not config.performance.memmap:
+            logger.debug("Memory mapping disabled via config.toml")
+        else:
+            logger.debug("Memory mapping enabled via config.toml")
 
 
 def validate_config_file(config_path: Path) -> bool:

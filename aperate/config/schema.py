@@ -176,6 +176,12 @@ class ExtinctionCorrectionConfig:
 
 
 @dataclass
+class PerformanceConfig:
+    """Performance and memory configuration."""
+    memmap: bool = True  # Enable memory mapping for FITS files (reduces memory, increases I/O)
+
+
+@dataclass
 class PostprocessConfig:
     """Postprocessing step configuration."""
     merge_tiles: MergeTilesConfig = field(default_factory=MergeTilesConfig)
@@ -201,6 +207,9 @@ class AperateConfig:
     # Data sources
     data_sources: Dict[str, DataSource] = field(default_factory=dict)
     base_path: str = ""
+    
+    # Performance settings
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     
     # Pipeline steps
     psf_generation: PSFGenerationConfig = field(default_factory=PSFGenerationConfig)
@@ -262,6 +271,12 @@ class AperateConfig:
         post_data = steps.get('postprocess', {})
         postprocess = cls._parse_postprocess(post_data)
         
+        # Parse performance config
+        performance_data = data.get('performance', {})
+        performance = PerformanceConfig(
+            memmap=performance_data.get('memmap', True)
+        )
+        
         return cls(
             name=name,
             tiles=tiles,
@@ -271,6 +286,7 @@ class AperateConfig:
             checkplots=checkplots,
             data_sources=data_sources,
             base_path=base_path,
+            performance=performance,
             psf_generation=psf_generation,
             psf_homogenization=psf_homogenization,
             detection=detection,

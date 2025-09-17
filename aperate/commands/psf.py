@@ -8,6 +8,9 @@ from typing import Dict, List, Optional
 import click
 import numpy as np
 import sep
+sep.set_extract_pixstack(int(1e7))
+sep.set_sub_object_limit(4096)
+
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from astropy.io import fits
@@ -32,6 +35,7 @@ warnings.simplefilter('ignore', category=FITSFixedWarning)
 # Nominal PSF FWHMs (in arcsec) for different filters
 # These are used for aperture radius calculations
 NOMINAL_PSF_FWHMS = {
+    'vis': 0.140,
     'f435w': 0.045,
     'f606w': 0.075,
     'f814w': 0.100,
@@ -701,6 +705,7 @@ def psf_cmd(project_dir, filters, overwrite, checkplots):
             )
         except Exception as e:
             logger.error(f"Error generating PSF for {filter_name}: {str(e)}")
+            raise
             if len(filters_to_process) == 1:
                 raise
             else:

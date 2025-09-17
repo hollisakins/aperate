@@ -116,6 +116,9 @@ def get_unit_conversion(image_header, output_unit):
                 except Exception as e:
                     raise ValueError(f"Failed to compute HST unit conversion: {e}")
             
+            case 'uJy/pixel':
+                conversion = (1*u.uJy).to(output_unit).value
+
             case _:
                 raise ValueError(f"Unsupported image units: '{current_unit}'")
         
