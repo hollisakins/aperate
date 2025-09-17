@@ -69,6 +69,7 @@ NOMINAL_PSF_FWHMS = {
     'f466n': 0.152,
     'f470n': 0.154,
     'f480m': 0.157,
+    'f770w': 0.270,
 }
 
 def process_tile_psf(project_dir: Path, filter_name: str, tile: str, 
