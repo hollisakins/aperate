@@ -1189,6 +1189,7 @@ def postprocess_cmd(
                 return
             except Exception as e:
                 logger.error(f"Tile merging failed: {e}")
+                raise
                 raise click.ClickException("Merge step failed")
         else:
             logger.info("Tile merging disabled in config")

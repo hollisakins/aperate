@@ -101,6 +101,7 @@ def load_tile_catalog(project_dir: Path, project_name: str, tile: str) -> Tuple[
         return catalog, windowed
     except Exception as e:
         logger.warning(f"    Failed to load catalog {catalog_path}: {str(e)}")
+        raise
         return None, False
 
 
@@ -438,7 +439,8 @@ def compute_aper_photometry(
         fluxerr *= conversion
         logger.debug(f"        Applied unit conversion: {header.get('BUNIT', 'unknown')} -> {ctx.main_config.flux_unit} (factor: {conversion:.4e})")
     except Exception as e:
-        logger.warning(f"        Unit conversion failed for {filter_name}: {e}. Using native image units.")
+        logger.error(f"        Unit conversion failed for {filter_name}: {e}. Using native image units.")
+        raise
     
     # Add results to catalog (store aperture fluxes as 2D array with columns = aperture sizes)
     col_suffix = 'hom' if homogenized else 'nat'
@@ -605,7 +607,8 @@ def compute_auto_photometry(
         fluxerr *= conversion
         logger.debug(f"        Applied unit conversion: {header.get('BUNIT', 'unknown')} -> {ctx.main_config.flux_unit} (factor: {conversion:.4e})")
     except Exception as e:
-        logger.warning(f"        Unit conversion failed for {filter_name}: {e}. Using native image units.")
+        logger.error(f"        Unit conversion failed for {filter_name}: {e}. Using native image units.")
+        raise
     
     # Add results to catalog (store aperture fluxes as 2D array with columns = aperture sizes)
     ctx.catalog[f'f_auto_{filter_name}'] = flux
@@ -1024,6 +1027,7 @@ def process_photometry_tile(project_dir, tile, filters_to_process, config, image
         
     except Exception as e:
         logger.error(f"Error processing tile {tile}: {str(e)}")
+        raise
         return False
 
 
