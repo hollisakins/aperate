@@ -592,8 +592,14 @@ def compute_auto_photometry(
                     ) # flux2 = auto flux in <target_filter>, native-resolution
                     
                     # correction factor for the flux lost due to the larger PSF
-                    corr_fact = flux2/flux1
-                    
+                    # Use abs() because this is a positive aperture ratio by definition;
+                    # negative values arise when flux1 or flux2 is noise-dominated and
+                    # would incorrectly flip the sign of flux and error.
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore', RuntimeWarning)
+                        corr_fact = np.abs(flux2/flux1)
+                    corr_fact = np.where(np.isfinite(corr_fact), corr_fact, 1.0)
+
                     flux *= corr_fact
                     fluxerr *= corr_fact
                     ctx.catalog[f'psf_corr_auto_{filter_name}'] = corr_fact
