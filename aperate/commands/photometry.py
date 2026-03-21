@@ -6,7 +6,7 @@ import multiprocessing as mp
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import click
 import numpy as np
@@ -45,7 +45,39 @@ class PhotometryContext:
     main_config: AperateConfig
     windowed: bool
     overwrite: bool
-    
+    _image_cache: Dict[str, np.ndarray] = field(default_factory=dict, repr=False)
+    _flux_cache: Dict[str, object] = field(default_factory=dict, repr=False)
+
+    def load_image(self, path, hdu_index=0) -> np.ndarray:
+        """Load a FITS image with byteorder conversion, caching by path."""
+        key = str(path)
+        if key not in self._image_cache:
+            with fits.open(path) as hdul:
+                data = hdul[hdu_index].data
+                data = data.astype(data.dtype.newbyteorder('='))
+            self._image_cache[key] = data
+        return self._image_cache[key]
+
+    def load_error(self, image_files) -> np.ndarray:
+        """Load error map (from ERR or WHT extension), with caching."""
+        if image_files.has_extension('err'):
+            return self.load_image(image_files.get_error_path())
+        elif image_files.has_extension('wht'):
+            wht_path = image_files.get_weight_path()
+            key = f"err_from_{wht_path}"
+            if key not in self._image_cache:
+                wht = self.load_image(wht_path)
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    self._image_cache[key] = 1.0 / np.sqrt(wht)
+            return self._image_cache[key]
+        else:
+            return None
+
+    def clear_image_cache(self):
+        """Free cached image arrays."""
+        self._image_cache.clear()
+
     def get_image_files(self, filter_name: str) -> Optional[ImageFiles]:
         """Get image files for any filter in the current tile.
         
@@ -226,52 +258,45 @@ def compute_weights(catalog: Table, image_files, filter_name: str, windowed: boo
     
     return catalog
 
-def compute_rhalf(catalog: Table, segmap: np.ndarray, image_files, filter_name: str, windowed: bool) -> Table:
+def compute_rhalf(ctx: PhotometryContext, filter_name: str, image_files) -> Table:
     """
     Measure half-light radii for each source.
-    
+
     Computes the radius containing half of the total flux for each source
     and stores it in a new column named 'rh_{filter_name}'.
-    Uses windowed positions (xwin, ywin) if windowed=True, otherwise uses (x, y).
-    
+
     Args:
-        catalog: Source catalog table
-        segmap: Segmentation map (loaded separately)
-        image_files: ImageFiles object containing file paths
+        ctx: PhotometryContext containing all resources
         filter_name: Filter name for column naming
-        windowed: Whether to use windowed positions
-        
+        image_files: ImageFiles object containing file paths
+
     Returns:
         Updated catalog with half-light radius column
     """
-    logger = get_logger()
-    logger.debug(f"        Computing half-light radii for {filter_name} (windowed={windowed})")
-    
+    logger = ctx.get_logger()
+    logger.debug(f"        Computing half-light radii for {filter_name} (windowed={ctx.windowed})")
+
     # Get source positions using helper function
-    x_pos, y_pos = get_source_positions(catalog, windowed)
-    
-    sci_path = image_files.get_science_path()
+    x_pos, y_pos = get_source_positions(ctx.catalog, ctx.windowed)
 
-    with fits.open(sci_path) as sci_hdul:
-        sci = sci_hdul[0].data
-        sci = sci.astype(sci.dtype.newbyteorder('='))
-        mask = np.isnan(sci)
+    sci = ctx.load_image(image_files.get_science_path())
+    mask = np.isnan(sci)
 
-        flux, fluxerr, flag = sep.sum_ellipse(
-            sci, x_pos, y_pos, catalog['a'], catalog['b'], catalog['theta'], 
-            2.5*catalog['kronrad'], subpix=1, mask=mask,
-            seg_id=catalog['id'], segmap=segmap,
-        )
+    flux, fluxerr, flag = sep.sum_ellipse(
+        sci, x_pos, y_pos, ctx.catalog['a'], ctx.catalog['b'], ctx.catalog['theta'],
+        2.5*ctx.catalog['kronrad'], subpix=1, mask=mask,
+        seg_id=ctx.catalog['id'], segmap=ctx.segmap,
+    )
 
-        rhalf, rflag = sep.flux_radius(
-            sci, x_pos, y_pos, 6.*catalog['a'], 0.5, 
-            seg_id=catalog['id'], segmap=segmap,
-            mask=mask, normflux=flux, subpix=5
-        )
+    rhalf, rflag = sep.flux_radius(
+        sci, x_pos, y_pos, 6.*ctx.catalog['a'], 0.5,
+        seg_id=ctx.catalog['id'], segmap=ctx.segmap,
+        mask=mask, normflux=flux, subpix=5
+    )
 
-    catalog[f'rh_{filter_name}'] = rhalf
+    ctx.catalog[f'rh_{filter_name}'] = rhalf
 
-    return catalog
+    return ctx.catalog
 
 
 def compute_aper_photometry(
@@ -330,60 +355,43 @@ def compute_aper_photometry(
     # Convert aperture diameters from arcsec to pixels
     aperture_diameters_pixels = np.array(diameters) / pixel_scale
     
-    # Import sep here to avoid circular imports
-    import sep
-    
-    # Perform aperture photometry
-    # with fits.open(sci_path) as sci_hdul, fits.open(err_path) as err_hdul:
-
-    sci_hdul = fits.open(sci_path)
-    sci = sci_hdul[0].data
-
-    if image_files.has_extension('err'):
-        err_path = image_files.get_error_path()
-        err_hdul = fits.open(err_path)
-        err = err_hdul[0].data
-    elif image_files.has_extension('wht'):
-        wht_path = image_files.get_weight_path()
-        err_hdul = fits.open(wht_path)
-        wht = err_hdul[0].data
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            err = 1/np.sqrt(wht)
-    else:
+    # Load science and error images via cache
+    sci = ctx.load_image(sci_path)
+    err = ctx.load_error(image_files)
+    if err is None:
         logger.error('No ERR or WHT data found')
-        return 
-
-    sci = sci.astype(sci.dtype.newbyteorder('='))
-    err = err.astype(err.dtype.newbyteorder('='))
+        return ctx.catalog
     mask = ~np.isfinite(sci)
-    
+
     flux_list = []
     fluxerr_list = []
-    
+
     for diam_pix in aperture_diameters_pixels:
         flux_i, fluxerr_i, flag = sep.sum_circle(
-            sci, x_pos, y_pos, 
+            sci, x_pos, y_pos,
             diam_pix/2,  # sep expects radius, not diameter
-            err=err, 
-            mask=mask, 
-            segmap=ctx.segmap, 
+            err=err,
+            mask=mask,
+            segmap=ctx.segmap,
             seg_id=ctx.catalog['id'],
         )
         flux_list.append(flux_i)
         fluxerr_list.append(fluxerr_i)
-    
+
     # Stack results
     flux = np.column_stack(flux_list)
     fluxerr = np.column_stack(fluxerr_list)
 
-    sci_hdul.close()
-    err_hdul.close()
+    # Cache raw (pre-unit-conversion) aperture fluxes for aper_corr reuse
+    if homogenized and ctx.photometry_config.aperture.aper_corr:
+        aper_corr_filter = ctx.photometry_config.aperture.aper_corr_filter
+        if aper_corr_filter != 'detection' and filter_name == aper_corr_filter:
+            ctx._flux_cache[f'aper_raw_{filter_name}'] = flux.copy()
 
     # Apply PSF corrections for inverse filters if doing PSF-homogenized photometry
     if homogenized and ctx.psfs_config and ctx.is_inverse_filter(filter_name):
         logger.info(f'        Correcting {filter_name} based on {ctx.psfs_config.target_filter} homogenization')
-        
+
         # Get target filter image files
         target_image_files = ctx.get_image_files(ctx.psfs_config.target_filter)
         if not target_image_files:
@@ -392,43 +400,40 @@ def compute_aper_photometry(
             # Compute aperture flux in target filter's PSF-homogenized image (homogenized to current filter)
             target_hom_path = image_files.get_homogenized_path(ctx.psfs_config.target_filter)
             target_sci_path = target_image_files.get_science_path()
-            
+
             if target_hom_path and target_hom_path.exists():
-                with fits.open(target_hom_path) as hom_hdul, fits.open(target_sci_path) as sci_hdul:
-                    hom_data = hom_hdul[0].data
-                    sci_data = sci_hdul[0].data
-                    hom_data = hom_data.astype(hom_data.dtype.newbyteorder('='))
-                    sci_data = sci_data.astype(sci_data.dtype.newbyteorder('='))
-                    mask = ~np.isfinite(hom_data)
-                    
-                    flux1_list = []
-                    flux2_list = []
-                    
-                    for diam_pix in aperture_diameters_pixels:
-                        # Flux in target filter homogenized to current filter
-                        flux1, _, _ = sep.sum_circle(
-                            hom_data, x_pos, y_pos, diam_pix/2,
-                            mask=mask, segmap=ctx.segmap, seg_id=ctx.catalog['id']
-                        )
-                        # Flux in target filter native resolution
-                        flux2, _, _ = sep.sum_circle(
-                            sci_data, x_pos, y_pos, diam_pix/2,
-                            mask=mask, segmap=ctx.segmap, seg_id=ctx.catalog['id']
-                        )
-                        flux1_list.append(flux1)
-                        flux2_list.append(flux2)
-                    
-                    flux1 = np.column_stack(flux1_list)
-                    flux2 = np.column_stack(flux2_list)
-                    
-                    # Correction factor for flux lost due to larger PSF
-                    corr_fact = flux2 / flux1
-                    flux *= corr_fact
-                    fluxerr *= corr_fact
-                    
-                    # Store correction factors
-                    ctx.catalog[f'psf_corr_aper_{filter_name}'] = corr_fact
-                    logger.debug(f'        Correction factors: {np.median(corr_fact, axis=1)}')
+                hom_data = ctx.load_image(target_hom_path)
+                sci_data = ctx.load_image(target_sci_path)
+                corr_mask = ~np.isfinite(hom_data)
+
+                flux1_list = []
+                flux2_list = []
+
+                for diam_pix in aperture_diameters_pixels:
+                    # Flux in target filter homogenized to current filter
+                    flux1, _, _ = sep.sum_circle(
+                        hom_data, x_pos, y_pos, diam_pix/2,
+                        mask=corr_mask, segmap=ctx.segmap, seg_id=ctx.catalog['id']
+                    )
+                    # Flux in target filter native resolution
+                    flux2, _, _ = sep.sum_circle(
+                        sci_data, x_pos, y_pos, diam_pix/2,
+                        mask=corr_mask, segmap=ctx.segmap, seg_id=ctx.catalog['id']
+                    )
+                    flux1_list.append(flux1)
+                    flux2_list.append(flux2)
+
+                flux1 = np.column_stack(flux1_list)
+                flux2 = np.column_stack(flux2_list)
+
+                # Correction factor for flux lost due to larger PSF
+                corr_fact = flux2 / flux1
+                flux *= corr_fact
+                fluxerr *= corr_fact
+
+                # Store correction factors
+                ctx.catalog[f'psf_corr_aper_{filter_name}'] = corr_fact
+                logger.debug(f'        Correction factors: {np.median(corr_fact, axis=1)}')
             else:
                 logger.warning(f"PSF correction skipped: homogenized target image not found")
     
@@ -533,76 +538,71 @@ def compute_auto_photometry(
     
     
     header = fits.getheader(sci_path)
-    #pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
-     
-    sci_hdul = fits.open(sci_path)
-    sci = sci_hdul[0].data
 
-    if image_files.has_extension('err'):
-        err_path = image_files.get_error_path()
-        err_hdul = fits.open(err_path)
-        err = err_hdul[0].data
-    elif image_files.has_extension('wht'):
-        wht_path = image_files.get_weight_path()
-        err_hdul = fits.open(wht_path)
-        wht = err_hdul[0].data
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            err = 1/np.sqrt(wht)
-    else:
+    # Load science and error images via cache
+    sci = ctx.load_image(sci_path)
+    err = ctx.load_error(image_files)
+    if err is None:
         logger.error('No ERR or WHT data found')
-        return 
-
-    sci = sci.astype(sci.dtype.newbyteorder('='))
-    err = err.astype(err.dtype.newbyteorder('='))
+        return ctx.catalog
     mask = ~np.isfinite(sci)
-    
-    
+
     # Run the auto photometry calculation
     flux, fluxerr, flag, a, b = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
+
+    # Cache raw (pre-unit-conversion) auto flux for kron_corr and aper_corr reuse
+    # Use filter-specific keys since kron_corr_filter and aper_corr_filter may differ
+    cache_filters = set()
+    if ctx.photometry_config.auto.kron_corr:
+        kf = ctx.photometry_config.auto.kron_corr_filter
+        if kf != 'detection':
+            cache_filters.add(kf)
+    if ctx.photometry_config.aperture.aper_corr:
+        af = ctx.photometry_config.aperture.aper_corr_filter
+        if af != 'detection':
+            cache_filters.add(af)
+    if filter_name in cache_filters:
+        ctx._flux_cache[f'auto_raw_{filter_name}'] = (flux.copy(), fluxerr.copy(), flag.copy(), a.copy(), b.copy())
 
     # Corrections
     if ctx.is_inverse_filter(filter_name):
         logger.info(f'        Correcting {filter_name} based on {ctx.psfs_config.target_filter} homogenization')
-        
+
         # Get target filter image files
         target_image_files = ctx.get_image_files(ctx.psfs_config.target_filter)
-        
+
         if not target_image_files:
             logger.warning(f"Cannot perform PSF correction: target filter {ctx.psfs_config.target_filter} not found")
         else:
             # Compute auto flux in target filter's PSF-homogenized image (homogenized to current filter)
             target_hom_path = image_files.get_homogenized_path(ctx.psfs_config.target_filter)
             target_sci_path = target_image_files.get_science_path()
-            
+
             if target_hom_path and target_hom_path.exists():
-                with fits.open(target_hom_path) as hom_hdul, fits.open(target_sci_path) as sci_hdul:
-                    hom_data = hom_hdul[0].data
-                    sci_data = sci_hdul[0].data
-                    hom_data = hom_data.astype(hom_data.dtype.newbyteorder('='))
-                    sci_data = sci_data.astype(sci_data.dtype.newbyteorder('='))
-                    mask = ~np.isfinite(hom_data)
+                hom_data = ctx.load_image(target_hom_path)
+                sci_data = ctx.load_image(target_sci_path)
+                corr_mask = ~np.isfinite(hom_data)
 
-                    flux1, _, _, _, _ = _compute_auto_photometry(
-                        hom_data, None, mask, x_pos, y_pos, ctx, kron_params,
-                    ) # flux1 = auto flux in <target_filter>, psf-homogenized to <filter>
+                flux1, _, _, _, _ = _compute_auto_photometry(
+                    hom_data, None, corr_mask, x_pos, y_pos, ctx, kron_params,
+                ) # flux1 = auto flux in <target_filter>, psf-homogenized to <filter>
 
-                    flux2, _, _, _, _ = _compute_auto_photometry(
-                        sci_data, None, mask, x_pos, y_pos, ctx, kron_params,
-                    ) # flux2 = auto flux in <target_filter>, native-resolution
-                    
-                    # correction factor for the flux lost due to the larger PSF
-                    # Use abs() because this is a positive aperture ratio by definition;
-                    # negative values arise when flux1 or flux2 is noise-dominated and
-                    # would incorrectly flip the sign of flux and error.
-                    with warnings.catch_warnings():
-                        warnings.simplefilter('ignore', RuntimeWarning)
-                        corr_fact = np.abs(flux2/flux1)
-                    corr_fact = np.where(np.isfinite(corr_fact), corr_fact, 1.0)
+                flux2, _, _, _, _ = _compute_auto_photometry(
+                    sci_data, None, corr_mask, x_pos, y_pos, ctx, kron_params,
+                ) # flux2 = auto flux in <target_filter>, native-resolution
 
-                    flux *= corr_fact
-                    fluxerr *= corr_fact
-                    ctx.catalog[f'psf_corr_auto_{filter_name}'] = corr_fact
+                # correction factor for the flux lost due to the larger PSF
+                # Use abs() because this is a positive aperture ratio by definition;
+                # negative values arise when flux1 or flux2 is noise-dominated and
+                # would incorrectly flip the sign of flux and error.
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)
+                    corr_fact = np.abs(flux2/flux1)
+                corr_fact = np.where(np.isfinite(corr_fact), corr_fact, 1.0)
+
+                flux *= corr_fact
+                fluxerr *= corr_fact
+                ctx.catalog[f'psf_corr_auto_{filter_name}'] = corr_fact
             else:
                 logger.warning(f"PSF correction skipped: homogenized target image not found")
     
@@ -662,32 +662,30 @@ def apply_kron_corr(
         if not det_path or not det_path.exists():
             logger.error("Detection image not found for Kron correction")
             return
-        
+
         logger.debug(f"Using detection image: {det_path}")
+        sci = ctx.load_image(det_path, hdu_index=1)
+        mask = ~np.isfinite(sci)
+        err = None
+
+        # Compute fluxes with both Kron parameters
+        flux1, _, _, a1, b1 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params1)
+        flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params2)
+
+        # Get pixel scale from header
         with fits.open(det_path) as det_hdul:
-            sci = det_hdul[1].data
-            sci = sci.astype(sci.dtype.newbyteorder('='))
-            mask = ~np.isfinite(sci)
-            err = None  # Detection images typically don't have error maps
-            
-            # Compute fluxes with both Kron parameters
-            flux1, _, _, a1, b1 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params1)
-            flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params2)
-            
-            # Get pixel scale from header
             header = det_hdul[1].header
             pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
-    
+
     else:
         # Use specific filter image
         image_files = ctx.get_image_files(kron_corr_filter)
         if not image_files:
             logger.error(f"Filter {kron_corr_filter} not found for Kron correction")
             return
-        
+
         # Determine which image to use (prefer homogenized if appropriate)
         if ctx.psfs_config and not ctx.is_target_filter(kron_corr_filter) and not ctx.is_inverse_filter(kron_corr_filter):
-            # Use homogenized image for non-target, non-inverse filters
             hom_path = image_files.get_homogenized_path(ctx.psfs_config.target_filter)
             if hom_path and hom_path.exists():
                 sci_path = hom_path
@@ -698,20 +696,24 @@ def apply_kron_corr(
         else:
             sci_path = image_files.get_science_path()
             logger.debug(f"Using native image for {kron_corr_filter}")
-        
-        # Load science and error data
-        with fits.open(sci_path) as sci_hdul:
-            sci = sci_hdul[0].data
-            sci = sci.astype(sci.dtype.newbyteorder('='))
-            mask = ~np.isfinite(sci)
-            header = sci_hdul[0].header
-            pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
-        
-        # Load error data if available
-        err = None
 
-        # Compute fluxes with both Kron parameters
-        flux1, _, _, a1, b1 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params1)
+        header = fits.getheader(sci_path)
+        pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
+
+        # Reuse cached flux1 from compute_auto_photometry if available
+        cache_key = f'auto_raw_{kron_corr_filter}'
+        if cache_key in ctx._flux_cache:
+            logger.debug(f"Using cached auto flux for kron_params1")
+            flux1, _, _, a1, b1 = ctx._flux_cache[cache_key]
+        else:
+            sci = ctx.load_image(sci_path)
+            mask = ~np.isfinite(sci)
+            flux1, _, _, a1, b1 = _compute_auto_photometry(sci, None, mask, x_pos, y_pos, ctx, kron_params1)
+
+        # flux2 always needs computing (different kron_params)
+        sci = ctx.load_image(sci_path)
+        mask = ~np.isfinite(sci)
+        err = None
         flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params2)
     
     # Calculate correction factor
@@ -779,92 +781,90 @@ def apply_aper_corr(
         # Use detection image
         det_path = ctx.images_config.get_tile_detection_image_path(ctx.tile)
         if not det_path or not det_path.exists():
-            logger.error("Detection image not found for Kron correction")
+            logger.error("Detection image not found for aperture correction")
             return
-        
+
         logger.debug(f"Using detection image: {det_path}")
+        sci = ctx.load_image(det_path, hdu_index=1)
+        mask = ~np.isfinite(sci)
+        err = None
+
+        # Get pixel scale from header
         with fits.open(det_path) as det_hdul:
-            sci = det_hdul[1].data
-            sci = sci.astype(sci.dtype.newbyteorder('='))
-            mask = ~np.isfinite(sci)
-            err = None 
-            
-            # Get pixel scale from header
             header = det_hdul[1].header
             pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
-            
-            # Convert aperture diameters from arcsec to pixels
-            aperture_diameters_pixels = np.array(aperture_diameters) / pixel_scale
-            
-            flux_list = []
-            for diam_pix in aperture_diameters_pixels:
-                flux_i, fluxerr_i, flag = sep.sum_circle(
-                    sci, x_pos, y_pos, 
-                    diam_pix/2,  # sep expects radius, not diameter
-                    err=err, 
-                    mask=mask, 
-                    segmap=ctx.segmap, 
-                    seg_id=ctx.catalog['id'],
-                )
-                flux_list.append(flux_i)
-            
-            # Stack results
-            flux1 = np.column_stack(flux_list)
 
-            # Compute fluxes with Kron parameters
-            flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
-    
-    else:
-        # Use specific filter image
-        image_files = ctx.get_image_files(aper_corr_filter)
-        if not image_files:
-            logger.error(f"Filter {aper_corr_filter} not found for Kron correction")
-            return
-        
-        # Determine which image to use (prefer homogenized if appropriate)
-        if ctx.psfs_config and not ctx.is_target_filter(aper_corr_filter) and not ctx.is_inverse_filter(aper_corr_filter):
-            # Use homogenized image for non-target, non-inverse filters
-            hom_path = image_files.get_homogenized_path(ctx.psfs_config.target_filter)
-            if hom_path and hom_path.exists():
-                sci_path = hom_path
-                logger.debug(f"Using homogenized image for {aper_corr_filter}")
-            else:
-                sci_path = image_files.get_science_path()
-                logger.debug(f"Using native image for {aper_corr_filter} (homogenized not found)")
-        else:
-            sci_path = image_files.get_science_path()
-            logger.debug(f"Using native image for {aper_corr_filter}")
-        
-        # Load science and error data
-        with fits.open(sci_path) as sci_hdul:
-            sci = sci_hdul[0].data
-            sci = sci.astype(sci.dtype.newbyteorder('='))
-            mask = ~np.isfinite(sci)
-            header = sci_hdul[0].header
-            pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
-        
-        err = None
-        
         # Convert aperture diameters from arcsec to pixels
         aperture_diameters_pixels = np.array(aperture_diameters) / pixel_scale
 
         flux_list = []
         for diam_pix in aperture_diameters_pixels:
             flux_i, fluxerr_i, flag = sep.sum_circle(
-                sci, x_pos, y_pos, 
-                diam_pix/2,  # sep expects radius, not diameter
-                err=err, 
-                mask=mask, 
-                segmap=ctx.segmap, 
+                sci, x_pos, y_pos,
+                diam_pix/2,
+                err=err,
+                mask=mask,
+                segmap=ctx.segmap,
                 seg_id=ctx.catalog['id'],
             )
             flux_list.append(flux_i)
-        
-        # Stack results
+
         flux1 = np.column_stack(flux_list)
-        
-        # Compute fluxes with Kron parameters
         flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
+
+    else:
+        # Try to use cached flux results from earlier photometry computation
+        aper_key = f'aper_raw_{aper_corr_filter}'
+        auto_key = f'auto_raw_{aper_corr_filter}'
+        have_aper_cache = aper_key in ctx._flux_cache
+        have_auto_cache = auto_key in ctx._flux_cache
+
+        if have_aper_cache and have_auto_cache:
+            logger.debug(f"Using cached aperture and auto fluxes for correction")
+            flux1 = ctx._flux_cache[aper_key]
+            flux2, _, _, _, _ = ctx._flux_cache[auto_key]
+        else:
+            # Fallback: load image and compute
+            image_files = ctx.get_image_files(aper_corr_filter)
+            if not image_files:
+                logger.error(f"Filter {aper_corr_filter} not found for aperture correction")
+                return
+
+            if ctx.psfs_config and not ctx.is_target_filter(aper_corr_filter) and not ctx.is_inverse_filter(aper_corr_filter):
+                hom_path = image_files.get_homogenized_path(ctx.psfs_config.target_filter)
+                if hom_path and hom_path.exists():
+                    sci_path = hom_path
+                    logger.debug(f"Using homogenized image for {aper_corr_filter}")
+                else:
+                    sci_path = image_files.get_science_path()
+                    logger.debug(f"Using native image for {aper_corr_filter} (homogenized not found)")
+            else:
+                sci_path = image_files.get_science_path()
+                logger.debug(f"Using native image for {aper_corr_filter}")
+
+            header = fits.getheader(sci_path)
+            pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
+
+            sci = ctx.load_image(sci_path)
+            mask = ~np.isfinite(sci)
+            err = None
+
+            aperture_diameters_pixels = np.array(aperture_diameters) / pixel_scale
+
+            flux_list = []
+            for diam_pix in aperture_diameters_pixels:
+                flux_i, fluxerr_i, flag = sep.sum_circle(
+                    sci, x_pos, y_pos,
+                    diam_pix/2,
+                    err=err,
+                    mask=mask,
+                    segmap=ctx.segmap,
+                    seg_id=ctx.catalog['id'],
+                )
+                flux_list.append(flux_i)
+
+            flux1 = np.column_stack(flux_list)
+            flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
     
     # Calculate correction factor
     aper_corr = flux2[:, np.newaxis] / flux1
@@ -924,7 +924,7 @@ def process_photometry_for_filter(ctx: PhotometryContext, filter_name: str) -> T
     
     # Compute half-light radii if requested
     if ctx.photometry_config.compute_rhalf:
-        ctx.catalog = compute_rhalf(ctx.catalog, ctx.segmap, image_files, filter_name, ctx.windowed)
+        ctx.catalog = compute_rhalf(ctx, filter_name, image_files)
     
     # Compute aperture photometry on native images if requested
     if ctx.photometry_config.aperture.run_native and ctx.photometry_config.aperture.diameters:
@@ -968,7 +968,12 @@ def process_photometry_tile(project_dir, tile, filters_to_process, config, image
         
         # Validate catalog has required position columns
         validate_catalog_positions(catalog, windowed)
-        
+
+        # Sort catalog by y (slow/row axis) for better cache locality in sep calls
+        pos_col = 'ywin' if windowed else 'y'
+        sort_idx = np.argsort(catalog[pos_col])
+        catalog = catalog[sort_idx]
+
         # Load segmentation map (per-tile, shared across filters)
         segmap = load_segmentation_map(images_config, tile)
         segmap = segmap.astype(segmap.dtype.newbyteorder('='))
@@ -1000,7 +1005,8 @@ def process_photometry_tile(project_dir, tile, filters_to_process, config, image
             
             # Run photometry functions for this filter
             ctx.catalog = process_photometry_for_filter(ctx, filter_name)
-        
+            ctx.clear_image_cache()  # Free image arrays between filters
+
         # Apply Kron correction after all filters processed
         if ctx.photometry_config.auto.run and ctx.photometry_config.auto.kron_corr:
             logger.info("  Applying Kron correction to AUTO photometry")
