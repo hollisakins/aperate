@@ -136,8 +136,19 @@ def merge_preserve_derived_files(
                 else:
                     logger.debug(f"Skipped missing derived file: {full_path}")
     
-    # No need to preserve base_path or psf_base_path - we now use absolute paths
-    
+    # Preserve the top-level detection table ([images.detection.<tile>] det/segmap),
+    # written by `aperate detect`; it is not part of discovery and was previously dropped.
+    old_detection = old_images.get('images', {}).get('detection', {})
+    kept_detection = {}
+    for tile, entry in old_detection.items():
+        if all(Path(p).exists() for p in entry.values()):
+            kept_detection[tile] = entry
+        else:
+            logger.debug(f"Skipped detection entry for {tile}: file missing")
+    if kept_detection:
+        merged['images']['detection'] = kept_detection
+        logger.info(f"Preserved detection entries for {len(kept_detection)} tiles")
+
     if derived_extensions:
         ext_list = sorted(derived_extensions)
         logger.info(f"Preserved {preserved_count} derived files: {', '.join(ext_list)}")

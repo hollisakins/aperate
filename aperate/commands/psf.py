@@ -37,9 +37,16 @@ warnings.simplefilter('ignore', category=FITSFixedWarning)
 NOMINAL_PSF_FWHMS = {
     'vis': 0.140,
     'f435w': 0.045,
+    'f475w': 0.055,   # CLUTCH v0.5 additions (ACS + WFC3/IR), interpolated between neighbours
     'f606w': 0.075,
     'f814w': 0.100,
+    'f850l': 0.105,
     'f098m': 0.210,
+    'f105w': 0.215,
+    'f110w': 0.220,
+    'f125w': 0.230,
+    'f140w': 0.240,
+    'f160w': 0.250,
     'f070w': 0.023,
     'f090w': 0.030,
     'f115w': 0.037,
@@ -309,6 +316,79 @@ def plot_psf(psf_data: np.ndarray, plot_path: Path):
         
 
 
+def extract_star_stamp(sci_data: np.ndarray, x: float, y: float, psf_size: int) -> Optional[np.ndarray]:
+    """
+    Cut a psf_size x psf_size stamp around a star, recentre it on the array centre
+    (index psf_size//2) with a cubic sub-pixel shift, subtract a local background
+    and normalise it to unit flux inside r <= psf_size/4.
+
+    Returns None if the star is too close to the edge, has invalid pixels in its
+    core, or has non-positive flux.
+    """
+    from scipy.ndimage import shift as ndshift
+
+    try:
+        cutout = Cutout2D(sci_data, position=(x, y), size=psf_size, mode='strict')
+    except (NoOverlapError, PartialOverlapError):
+        return None
+
+    data = cutout.data.astype(np.float64)
+    # Fractional offset of the windowed centroid from the stamp centre
+    dx = cutout.input_position_cutout[0] - psf_size // 2
+    dy = cutout.input_position_cutout[1] - psf_size // 2
+
+    valid = np.isfinite(data)
+    filled = np.where(valid, data, 0.0)
+    # order=5: <0.3% sigma bias for a 2.2-px FWHM PSF (cubic: 1%; integer/median stacking: -3.6%)
+    shifted = ndshift(filled, (-dy, -dx), order=5, mode='constant', cval=0.0)
+    vshift = ndshift(valid.astype(np.float64), (-dy, -dx), order=1, mode='constant', cval=0.0)
+    shifted[vshift < 0.99] = np.nan
+
+    c = psf_size // 2
+    yy, xx = np.indices((psf_size, psf_size))
+    r = np.hypot(xx - c, yy - c)
+
+    core = r <= psf_size / 4
+    if not np.all(np.isfinite(shifted[core])):
+        return None
+
+    # Local background from the outer annulus, flux normalisation from the core
+    annulus = (r > 0.40 * psf_size) & (r < 0.50 * psf_size)
+    shifted = shifted - np.nanmedian(shifted[annulus])
+    flux = np.nansum(shifted[core])
+    if not np.isfinite(flux) or flux <= 0:
+        return None
+
+    return (shifted / flux).astype(np.float32)
+
+
+def stack_star_stamps(stamps: List[np.ndarray], psf_size: int, az_average: bool) -> np.ndarray:
+    """
+    Median-combine recentred, normalised star stamps into a PSF model. If
+    az_average is set, the stacked image is azimuthally averaged by rotating
+    it (about the array centre, where every star has been placed) through 36
+    angles and averaging.
+    """
+    from scipy.ndimage import rotate as ndrotate
+
+    if len(stamps) == 0:
+        raise ValueError("No usable star stamps to stack")
+    stack = np.stack(stamps, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)
+        psf = np.nanmedian(stack, axis=0)
+    psf = np.where(np.isfinite(psf), psf, 0.0).astype(np.float64)
+
+    if az_average:
+        acc = np.zeros_like(psf)
+        angles = np.arange(0, 360, 10.0)
+        for ang in angles:
+            acc += ndrotate(psf, ang, reshape=False, order=3, mode='constant', cval=0.0)
+        psf = acc / len(angles)
+
+    return psf
+
+
 def create_individual_psf_from_tile(project_dir: Path, filter_name: str, tile: str,
                                    psf_data: Dict) -> np.ndarray:
     """Create PSF from individual tile data"""
@@ -326,47 +406,17 @@ def create_individual_psf_from_tile(project_dir: Path, filter_name: str, tile: s
     with fits.open(sci_path) as hdul:
         sci_data = hdul[0].data.astype(np.float32)
     
-    # Create PSF grid - PRESERVE EXACT ORIGINAL CALCULATIONS
-    x_grid, y_grid = np.zeros(psf_size**2 * len(x)), np.zeros(psf_size**2 * len(y))
-    z_grid = np.zeros(psf_size**2 * len(y))
-    
+    # Recentred, normalised stamps -> median stack (-> azimuthal average)
+    stamps = []
     for i in range(len(x)):
-        xi, yi = np.arange(psf_size)+0.5, np.arange(psf_size)+0.5
-        xi, yi = np.meshgrid(xi, yi)
-        xi, yi = xi.flatten(), yi.flatten()
-        try:
-            cutout = Cutout2D(sci_data, position=(x[i],y[i]), size=psf_size, mode='strict')
-            # Correct for sub-pixel offset in the windowed position 
-            dx = cutout.input_position_cutout[0] - psf_size//2
-            dy = cutout.input_position_cutout[1] - psf_size//2
-            xi += dx
-            yi += dy
-            zi = cutout.data.flatten()
-        except (NoOverlapError, PartialOverlapError):
-            zi = np.full(psf_size**2, np.nan)
-
-        if az_average:
-            theta = np.random.uniform(0, np.pi)
-            xp = (xi-psf_size/2) * np.cos(theta) - (yi-psf_size/2) * np.sin(theta) + psf_size/2
-            yp = (xi-psf_size/2) * np.sin(theta) + (yi-psf_size/2) * np.cos(theta) + psf_size/2
-            xi = xp
-            yi = yp
-
-        x_grid[i*(psf_size**2):(i+1)*(psf_size)**2] = xi
-        y_grid[i*(psf_size**2):(i+1)*(psf_size)**2] = yi
-        z_grid[i*(psf_size**2):(i+1)*(psf_size)**2] = zi
-
-    x_bins = np.arange(psf_size)
-    y_bins = np.arange(psf_size) 
-    x_bins = np.append(x_bins, x_bins[-1]+1)
-    y_bins = np.append(y_bins, y_bins[-1]+1)
-
-    psf, _, _, _ = binned_statistic_2d(
-        x_grid, y_grid, z_grid, 
-        bins=(x_bins, y_bins), 
-        statistic=np.nanmedian
-    )
-    psf = psf.T
+        stamp = extract_star_stamp(sci_data, x[i], y[i], psf_size)
+        if stamp is not None:
+            stamps.append(stamp)
+    logger.info(f'Stacking {len(stamps)} of {len(x)} stars (rest rejected: edge/NaN core/non-positive flux)')
+    if len(stamps) == 0:
+        logger.warning(f'{filter_name}-{tile}: no usable star stamps, skipping tile PSF')
+        return None
+    psf = stack_star_stamps(stamps, psf_size, az_average)
 
     # Subtract the background from the PSF - PRESERVE EXACT CALCULATIONS
     logger.info('Background-subtracting PSF')
@@ -419,67 +469,25 @@ def create_master_psf(project_dir: Path, filter_name: str,
     
     logger.info('Computing master PSF model')
     
-    # Create PSF grid - PRESERVE EXACT ORIGINAL CALCULATIONS
-    x_grid, y_grid = np.zeros(psf_size**2 * len(x_all)), np.zeros(psf_size**2 * len(y_all))
-    z_grid = np.zeros(psf_size**2 * len(y_all))
-    
-    # Load tile images as needed (memory efficient)
-    tile_data_cache = {}
-    
-    for i in range(len(x_all)):
-        xi, yi = np.arange(psf_size)+0.5, np.arange(psf_size)+0.5
-        xi, yi = np.meshgrid(xi, yi)
-        xi, yi = xi.flatten(), yi.flatten()
-        
-        # Get the tile for this star
-        tile_idx = which_tile[i]
-        tile_info = psf_data_list[tile_idx]
-        sci_path = Path(tile_info['sci_path'])
-        
-        # Load tile data if not cached
-        if tile_idx not in tile_data_cache:
-            with fits.open(sci_path) as hdul:
-                tile_data_cache[tile_idx] = hdul[0].data.astype(np.float32)
-        
-        sci_data = tile_data_cache[tile_idx]
-        
-        try:
-            cutout = Cutout2D(sci_data, position=(x_all[i],y_all[i]), size=psf_size, mode='strict')
-            dx = cutout.input_position_cutout[0] - psf_size//2
-            dy = cutout.input_position_cutout[1] - psf_size//2
-            xi += dx
-            yi += dy
-            zi = cutout.data.flatten()
-        except (NoOverlapError, PartialOverlapError):
-            zi = np.full(psf_size**2, np.nan)
-
-        if az_average:
-            theta = np.random.uniform(0, np.pi)
-            xp = (xi-psf_size/2) * np.cos(theta) - (yi-psf_size/2) * np.sin(theta) + psf_size/2
-            yp = (xi-psf_size/2) * np.sin(theta) + (yi-psf_size/2) * np.cos(theta) + psf_size/2
-            xi = xp
-            yi = yp
-
-        x_grid[i*(psf_size**2):(i+1)*(psf_size)**2] = xi
-        y_grid[i*(psf_size**2):(i+1)*(psf_size)**2] = yi
-        z_grid[i*(psf_size**2):(i+1)*(psf_size)**2] = zi
-        
-        # Clear cache if this is the last star from this tile
-        remaining_tiles = [which_tile[j] for j in range(i+1, len(x_all))]
-        if tile_idx not in remaining_tiles:
-            del tile_data_cache[tile_idx]
-
-    x_bins = np.arange(psf_size)
-    y_bins = np.arange(psf_size) 
-    x_bins = np.append(x_bins, x_bins[-1]+1)
-    y_bins = np.append(y_bins, y_bins[-1]+1)
-
-    psf, _, _, _ = binned_statistic_2d(
-        x_grid, y_grid, z_grid, 
-        bins=(x_bins, y_bins), 
-        statistic=np.nanmedian
-    )
-    psf = psf.T
+    # Recentred, normalised stamps from every tile -> one median stack (-> azimuthal average).
+    # Tiles are loaded one at a time; only the small stamps are kept.
+    stamps = []
+    for tile_idx, tile_info in enumerate(psf_data_list):
+        sel = which_tile == tile_idx
+        if not np.any(sel):
+            continue
+        with fits.open(Path(tile_info['sci_path'])) as hdul:
+            sci_data = hdul[0].data.astype(np.float32)
+        n_before = len(stamps)
+        for xs, ys in zip(x_all[sel], y_all[sel]):
+            stamp = extract_star_stamp(sci_data, xs, ys, psf_size)
+            if stamp is not None:
+                stamps.append(stamp)
+        logger.info(f"    {tile_info['tile']}: {len(stamps) - n_before} of {sel.sum()} stars stacked")
+        del sci_data
+        gc.collect()
+    logger.info(f'Stacking {len(stamps)} of {len(x_all)} stars')
+    psf = stack_star_stamps(stamps, psf_size, az_average)
 
     # Background subtract - PRESERVE EXACT CALCULATIONS
     logger.info('Background-subtracting master PSF')
@@ -601,10 +609,12 @@ def generate_psfs_for_filter(project_dir: Path, filter_name: str,
 
         logger.info(f"Creating individual PSF for {filter_name}-{tile}")
         psf = create_individual_psf_from_tile(
-            project_dir, 
-            filter_name, 
-            tile, 
+            project_dir,
+            filter_name,
+            tile,
             psf_data)
+        if psf is None:
+            continue
 
         psf_path = project_dir / "psfs" / f"psf_{filter_name}_{tile}.fits"
         save_psf(psf, psf_path, psf_data['wcs'], psf_data['pixel_scale'])

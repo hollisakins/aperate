@@ -298,12 +298,20 @@ def measure_random_apertures(
                     nsci[(rms <= 0)|~np.isfinite(rms)] = np.nan
                     nsci = nsci[np.isfinite(nsci)]
 
+                    if nsci.size == 0:
+                        # Tile file exists but has no valid pixels (sparse HST bands) -- skip it
+                        logger.warning(f'{filt} {tile}: no valid pixels, skipping in pixel-distribution fit')
+                        continue
+
                     # Select a subset of pixels to do the fitting — no need to use all of them (its slow)
                     nsci = np.random.choice(nsci, size=nrandom_pixels_per_tile)
                     fluxes[i:i+nrandom_pixels_per_tile] = nsci
                     i += nrandom_pixels_per_tile
 
-                _, rms1 = fit_pixel_dist(fluxes, sigma_upper=1.0, maxiters=5) 
+                fluxes = fluxes[:i]  # drop unfilled slots from skipped tiles
+                if i == 0:
+                    raise ValueError(f'{filt}: no valid pixels in any tile for random apertures')
+                _, rms1 = fit_pixel_dist(fluxes, sigma_upper=1.0, maxiters=5)
                 rms1_random = 1
 
 
@@ -353,6 +361,9 @@ def measure_random_apertures(
                     pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
 
                     n_valid_pixels = np.sum(np.isfinite(nsci))
+                    if n_valid_pixels == 0:
+                        logger.warning(f'{filt} {tile}: no valid pixels, skipping in random apertures')
+                        continue
                     area = n_valid_pixels * pixel_scale**2 / 3600
 
                     x, y = np.arange(np.shape(nsci)[1]), np.arange(np.shape(nsci)[0])

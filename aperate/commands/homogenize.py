@@ -24,6 +24,7 @@ from ..core.homogenize import (
 )
 from ..config.parser import load_config
 from ..config.images import load_images_config, update_homogenized_paths_in_images_toml
+from ..utils.helpers import fits_stem
 from ..config.psfs import load_psfs_config, create_psfs_toml, update_psfs_toml_with_missing_fwhms
 
 from astropy.wcs import FITSFixedWarning
@@ -142,7 +143,7 @@ def homogenize_filter_tile(
         return False
     
     # Construct output paths
-    base_name = sci_path.stem
+    base_name = fits_stem(sci_path)  # handles .fits.gz inputs
     output_dir = sci_path.parent
     
     # Replace extension in filename
