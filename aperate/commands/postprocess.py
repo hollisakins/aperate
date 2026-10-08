@@ -641,7 +641,9 @@ def calibrate_flux_uncertainties(
                 if filt in psfs_config.inverse_filters:
                     catalog[f'e_aper_hom_{filt}'] *= catalog[f'psf_corr_aper_{filt}']
 
-            catalog[f'e_aper_hom_{filt}'] *= catalog[f'aper_corr']
+            # Only present when aperture correction was enabled in photometry
+            if 'aper_corr' in catalog.columns:
+                catalog[f'e_aper_hom_{filt}'] *= catalog['aper_corr']
 
     return catalog
 
@@ -715,7 +717,7 @@ def _compute_psf_corr_grid(psf_path, output_file):
             bi = qj*ai
             ap = EllipticalAperture((np.shape(psf)[0]/2, np.shape(psf)[1]/2), a=ai, b=bi, theta=0)
             tab = aperture_photometry(psf, ap)
-            psf_corrs[i,j] = np.sum(psf)/float(tab['aperture_sum'])
+            psf_corrs[i,j] = np.sum(psf)/float(tab['aperture_sum'][0])
 
     psf_corrs = psf_corrs.T
     a, q = np.meshgrid(a, q)
