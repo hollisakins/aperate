@@ -813,18 +813,24 @@ def apply_aper_corr(
         flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
 
     else:
-        # Try to use cached flux results from earlier photometry computation
+        # Reuse fluxes cached by the main photometry pass where they are valid:
+        #  - aper_raw_<filter>: fixed-aperture fluxes on the same (homogenized) image -> always reusable
+        #  - auto_raw_<filter>: AUTO flux measured with auto.kron_params, which is only the
+        #    numerator we need if aper_corr_params happen to equal auto.kron_params.
         aper_key = f'aper_raw_{aper_corr_filter}'
         auto_key = f'auto_raw_{aper_corr_filter}'
         have_aper_cache = aper_key in ctx._flux_cache
-        have_auto_cache = auto_key in ctx._flux_cache
+        have_auto_cache = (
+            auto_key in ctx._flux_cache
+            and list(ctx.photometry_config.auto.kron_params) == list(kron_params)
+        )
 
         if have_aper_cache and have_auto_cache:
-            logger.debug(f"Using cached aperture and auto fluxes for correction")
+            logger.debug("Using cached aperture and auto fluxes for correction")
             flux1 = ctx._flux_cache[aper_key]
             flux2, _, _, _, _ = ctx._flux_cache[auto_key]
         else:
-            # Fallback: load image and compute
+            # Load the image and compute whatever is not cached
             image_files = ctx.get_image_files(aper_corr_filter)
             if not image_files:
                 logger.error(f"Filter {aper_corr_filter} not found for aperture correction")
@@ -849,23 +855,27 @@ def apply_aper_corr(
             mask = ~np.isfinite(sci)
             err = None
 
-            aperture_diameters_pixels = np.array(aperture_diameters) / pixel_scale
+            if have_aper_cache:
+                logger.debug("Using cached aperture fluxes for correction")
+                flux1 = ctx._flux_cache[aper_key]
+            else:
+                aperture_diameters_pixels = np.array(aperture_diameters) / pixel_scale
+                flux_list = []
+                for diam_pix in aperture_diameters_pixels:
+                    flux_i, fluxerr_i, flag = sep.sum_circle(
+                        sci, x_pos, y_pos,
+                        diam_pix/2,
+                        err=err,
+                        mask=mask,
+                        segmap=ctx.segmap,
+                        seg_id=ctx.catalog['id'],
+                    )
+                    flux_list.append(flux_i)
+                flux1 = np.column_stack(flux_list)
 
-            flux_list = []
-            for diam_pix in aperture_diameters_pixels:
-                flux_i, fluxerr_i, flag = sep.sum_circle(
-                    sci, x_pos, y_pos,
-                    diam_pix/2,
-                    err=err,
-                    mask=mask,
-                    segmap=ctx.segmap,
-                    seg_id=ctx.catalog['id'],
-                )
-                flux_list.append(flux_i)
-
-            flux1 = np.column_stack(flux_list)
+            # AUTO flux with the aperture-correction Kron parameters (not auto.kron_params)
             flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
-    
+
     # Calculate correction factor
     aper_corr = flux2[:, np.newaxis] / flux1
     
