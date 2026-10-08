@@ -53,6 +53,21 @@ def validate_project_directory(project_dir: Path) -> bool:
 # This is placeholder - user will add specific utilities as needed
 
 
+def fits_stem(path) -> str:
+    """
+    Filename with every FITS suffix removed ('x_sci.fits.gz' -> 'x_sci').
+
+    Path.stem only strips the last suffix, so gzipped inputs would otherwise
+    produce derived names like 'x_hom-f444w.fits.fits'.
+    """
+    from pathlib import Path
+    name = Path(path).name
+    for suffix in ('.gz', '.fz', '.fits', '.fit'):
+        if name.lower().endswith(suffix):
+            name = name[:-len(suffix)]
+    return name
+
+
 def get_unit_conversion(image_header, output_unit):
     """
     Get unit conversion factor from image native units to desired output units.
@@ -118,6 +133,9 @@ def get_unit_conversion(image_header, output_unit):
             
             case 'uJy/pixel':
                 conversion = (1*u.uJy).to(output_unit).value
+
+            case 'nJy' | 'nJy/pixel': # CLUTCH v0.5 HST mosaics (Koekemoer, Jul 2026)
+                conversion = (1*u.nJy).to(output_unit).value
 
             case _:
                 raise ValueError(f"Unsupported image units: '{current_unit}'")

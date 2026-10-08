@@ -1,5 +1,6 @@
 """Images.toml file handling for aperate."""
 
+import os
 import sys
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -23,6 +24,7 @@ import numpy as np
 from astropy.io import fits
 
 from ..core.logging import get_logger, print_error
+from ..utils.helpers import fits_stem
 
 
 @dataclass
@@ -258,8 +260,12 @@ def create_images_toml(images_data: Dict[str, Any], output_path: Path) -> None:
     logger = get_logger()
     
     try:
-        with open(output_path, 'w') as f:
+        # Write to a temp file and rename so concurrent readers (per-filter psf /
+        # homogenize jobs reload images.toml per tile) never see a partial file.
+        tmp_path = output_path.with_suffix('.toml.tmp')
+        with open(tmp_path, 'w') as f:
             toml.dump(images_data, f)
+        os.replace(tmp_path, output_path)
         logger.info(f"Created images.toml: {output_path}")
     except Exception as e:
         print_error(f"Failed to create images.toml: {e}")
@@ -423,7 +429,7 @@ def update_homogenized_paths_in_images_toml(
             continue
         
         # Construct homogenized filename - must match what homogenize_filter_tile creates
-        sci_name = Path(sci_path).stem
+        sci_name = fits_stem(sci_path)  # handles .fits.gz inputs
         
         # Determine the actual filename extension used (matches homogenize_filter_tile logic)
         # Filename includes prefix
