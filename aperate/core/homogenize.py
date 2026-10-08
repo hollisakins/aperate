@@ -331,12 +331,36 @@ def homogenize_image(
         sci_data = hdul[0].data.astype(np.float32)
         header = hdul[0].header.copy()
     
-    # Apply convolution using FFT
-    from astropy.convolution import convolve_fft
+    # NaN-safe homogenization via overlap-add convolution.
+    #
+    # JWST mosaics contain scattered NaNs throughout the science area (dead
+    # pixels, saturated cores, unrejected CRs), not just at the edges. A plain
+    # FFT convolution treats those as zero flux and biases every output pixel
+    # within a kernel radius of each NaN low. We instead do a normalized
+    # convolution: convolve the zero-filled image and a validity mask, then
+    # divide by the local valid kernel-weight fraction so each output pixel is
+    # renormalized by the weight that actually landed on valid pixels. This is
+    # equivalent to astropy convolve_fft(nan_treatment='interpolate',
+    # normalize_kernel=False), but overlap-add tiles the transform so peak
+    # memory stays a few GiB instead of ~200 GiB for a full-mosaic FFT (and is
+    # typically faster for a small kernel on a large image).
+    from scipy.signal import oaconvolve
 
-    # Convolve science image
-    homogenized = convolve_fft(sci_data, kernel, normalize_kernel=False, allow_huge=True)
-    
+    filled = np.nan_to_num(sci_data, nan=0.0)
+    mask = np.isfinite(sci_data).astype(np.float32)
+
+    num = oaconvolve(filled, kernel, mode='same')      # flux, missing regions = 0
+    den = oaconvolve(mask, kernel, mode='same')         # kernel weight on valid pixels
+    del filled, mask
+
+    # Renormalize by the local valid fraction (den / kernel_sum). In fully valid
+    # regions this fraction is 1, so the result matches the un-normalized
+    # convolution exactly; near NaNs it corrects the low bias.
+    kernel_sum = float(np.sum(kernel))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        homogenized = num * (kernel_sum / den)
+    del num, den
+
     # Ensure that pixels that were originally nan stay nan
     homogenized[~np.isfinite(sci_data)] = np.nan
 

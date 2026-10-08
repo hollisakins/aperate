@@ -366,10 +366,13 @@ def build_ivw_detection_image(
     logger.info(f"    [bold cyan]{tile}[/bold cyan]: Computing robust background statistics")
     median, sigma = fit_pixel_dist(data, sigma_upper=sigma_upper, maxiters=maxiters)
 
-    with warnings.catch_warnings(): 
-        warnings.simplefilter('ignore')    
-        detec_sci = (nivw - median) / np.sqrt(den)
-        detec_err = sigma / np.sqrt(den)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        # Cast back to float32: `median`/`sigma` are float64 scalars from the
+        # Gaussian fit and would otherwise upcast the float32 stack, doubling
+        # the on-disk detection image (e.g. 36 GB -> 18 GB for a full mosaic).
+        detec_sci = ((nivw - median) / np.sqrt(den)).astype(np.float32)
+        detec_err = (sigma / np.sqrt(den)).astype(np.float32)
 
     return detec_sci, detec_err, header
 
