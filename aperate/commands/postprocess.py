@@ -564,7 +564,8 @@ def calibrate_flux_uncertainties(
     """
     logger = get_logger()
     logger.info("Calibrating uncertainties using random aperture measurements")
-    
+    filters = _filters_to_apply(catalog, 'uncertainty_calibration', filters)
+
     for filt in filters:
         logger.info(f'Applying random aperture calibration for {filt}')
 
@@ -645,6 +646,7 @@ def calibrate_flux_uncertainties(
             if 'aper_corr' in catalog.columns:
                 catalog[f'e_aper_hom_{filt}'] *= catalog['aper_corr']
 
+    _record_applied(catalog, STEP_STATE_KEYS['uncertainty_calibration'], filters)
     return catalog
 
 
@@ -743,10 +745,39 @@ def _compute_psf_corr_grid(psf_path, output_file):
     return output_file
 
 
+# Header keywords of the merged catalog recording which filters each postprocess step has
+# already been applied to (comma-separated lists). Each step is applied once per merged
+# catalog; `postprocess --overwrite` rebuilds the merge from the tile catalogs and so resets
+# them. (Review finding F14: a second `postprocess` run re-applied the PSF grid, x1.126.)
+STEP_STATE_KEYS = {'psf_corrections': 'PSFCORR', 'uncertainty_calibration': 'ERRCAL',
+                   'extinction_correction': 'EXTCORR'}
+
+
+def _applied_filters(catalog: Table, key: str) -> set:
+    return {f for f in str(catalog.meta.get(key, '')).split(',') if f}
+
+
+def _record_applied(catalog: Table, key: str, filters) -> None:
+    catalog.meta[key] = ','.join(sorted(_applied_filters(catalog, key) | set(filters)))
+
+
+def _filters_to_apply(catalog: Table, step: str, filters: List[str]) -> List[str]:
+    """Drop the filters a step has already been applied to in this merged catalog."""
+    logger = get_logger()
+    done = _applied_filters(catalog, STEP_STATE_KEYS[step])
+    skipped = [f for f in filters if f in done]
+    if skipped:
+        logger.warning(f"{step}: already applied to {len(skipped)} filter(s) of this merged catalog "
+                       f"({', '.join(skipped[:6])}{', ...' if len(skipped) > 6 else ''}); skipping them. "
+                       f"Run `postprocess --overwrite` to rebuild the merged catalog from the tile "
+                       f"catalogs and apply every step once.")
+    return [f for f in filters if f not in done]
+
+
 def apply_psf_corrections(
     catalog: Table,
     psf_correction_dir: Path,
-    tiles: List[str], 
+    tiles: List[str],
     filters: List[str],
     psfs_config,
     aperture_diameters: List[float]
@@ -772,6 +803,7 @@ def apply_psf_corrections(
     # already brings them to the target resolution. Using the inverse filter's own grid here
     # applied that correction a second time (F17 in the 2026-10 review: F770W fluxes +15%).
     target = psfs_config.target_filter
+    filters = _filters_to_apply(catalog, 'psf_corrections', filters)
     for filt in filters:
         logger.info(filt)
         if psfs_config.master_psf:
@@ -785,6 +817,7 @@ def apply_psf_corrections(
                 psf_corr_file = psf_correction_dir / f'{target}_{tile}_psf_corr_grid.txt'
                 catalog = _apply_psf_corr(catalog, filt, tile, psf_corr_file, aperture_diameters)
 
+    _record_applied(catalog, STEP_STATE_KEYS['psf_corrections'], filters)
     return catalog
 
 
@@ -914,7 +947,8 @@ def apply_galactic_extinction_corr(
     """
     logger = get_logger()
     logger.info(f"Applying galactic extinction correction using {reddening_map_file.name}")
-    
+    filters = _filters_to_apply(catalog, 'extinction_correction', filters)
+
     # Load dust map
     with fits.open(reddening_map_file) as hdul:
         ebv_map = hdul[0].data
@@ -992,7 +1026,8 @@ def apply_galactic_extinction_corr(
     logger.info(f"Extinction correction applied to {n_corrected} columns")
     logger.info(f"  Median A_V = {np.median(Av_sources):.3f} mag")
     logger.info(f"  A_V range: [{np.min(Av_sources):.3f}, {np.max(Av_sources):.3f}] mag")
-    
+
+    _record_applied(catalog, STEP_STATE_KEYS['extinction_correction'], filters)
     return catalog
 
 
