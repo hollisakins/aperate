@@ -106,6 +106,53 @@ class PhotometryContext:
         return get_logger()
 
 
+# Primary-header keywords recording which filters' columns carry each multiplicative
+# correction (comma-separated filter lists). They make partial reruns safe: see
+# _apply_multiplicative_correction (review finding F03).
+CORRECTION_STATE_KEYS = {'KRONCORR': 'kron_corr', 'APERCORR': 'aper_corr'}
+
+
+def _mark_raw(catalog: Table, meta_key: str, filter_name: str) -> None:
+    """Record that filter_name's columns have just been (re)measured and are uncorrected."""
+    applied = [f for f in catalog.meta.get(meta_key, []) if f != filter_name]
+    catalog.meta[meta_key] = applied
+
+
+def _apply_multiplicative_correction(catalog: Table, column_prefixes, new_corr, old_corr, meta_key: str):
+    """Multiply the per-filter columns by new_corr so that the result does not depend on how
+    many times, or for which subset of filters, photometry has been run.
+
+    column_prefixes: e.g. ('f_auto_', 'e_auto_'); every column starting with the first prefix
+        defines a filter (the part after the prefix).
+    new_corr: correction to apply (shape broadcastable to the columns).
+    old_corr: the correction column stored by the previous run (None if there was none).
+    meta_key: catalog.meta entry listing the filters whose columns were corrected by the
+        previous run. Those columns are divided by old_corr first (entries where old_corr is
+        not finite or zero become NaN), so a rerun of `photometry --filters <subset>` never
+        multiplies an untouched filter twice (review finding F03: F277W x1.64 after an
+        F444W-only rerun in cosmos_v1.3). Filters re-measured in this run were removed from
+        the list by _mark_raw. Returns the list of filters now corrected.
+    """
+    applied = set(catalog.meta.get(meta_key, []))
+    first = column_prefixes[0]
+    filters = [c[len(first):] for c in catalog.colnames if c.startswith(first)]
+    for filt in filters:
+        for prefix in column_prefixes:
+            col = f'{prefix}{filt}'
+            if col not in catalog.colnames:
+                continue
+            values = np.asarray(catalog[col], dtype=float)
+            if filt in applied:
+                if old_corr is None:
+                    raise ValueError(f'{col} is recorded as corrected but the previous {meta_key} column is missing')
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    ok = np.isfinite(old_corr) & (old_corr != 0)
+                    values = np.where(ok, values / np.where(ok, old_corr, 1.0), np.nan)
+            catalog[col] = values * new_corr
+    catalog.meta[meta_key] = filters
+    return filters
+
+
 def load_tile_catalog(project_dir: Path, project_name: str, tile: str) -> Tuple[Optional[Table], bool]:
     """
     Load detection catalog for a specific tile.
@@ -129,6 +176,18 @@ def load_tile_catalog(project_dir: Path, project_name: str, tile: str) -> Tuple[
             catalog = Table(hdul['SOURCES'].data)
             # Get windowed flag from metadata, default to False for backward compatibility
             windowed = bool(hdul[0].header.get('WINDOWED', False))
+            # Which filters already carry the multiplicative corrections (see
+            # _apply_multiplicative_correction); comma-separated lists in the primary header.
+            for key, corr_col in CORRECTION_STATE_KEYS.items():
+                if key in hdul[0].header:
+                    catalog.meta[key] = [f for f in str(hdul[0].header[key]).split(',') if f]
+                elif corr_col in catalog.colnames:
+                    # Catalog written before the state keywords existed: a stored correction
+                    # column means a full run applied it to every filter present.
+                    prefix = 'f_auto_' if key == 'KRONCORR' else 'f_aper_hom_'
+                    catalog.meta[key] = [c[len(prefix):] for c in catalog.colnames if c.startswith(prefix)]
+                else:
+                    catalog.meta[key] = []
         logger.debug(f"    Loaded catalog from {catalog_path} (windowed={windowed})")
         return catalog, windowed
     except Exception as e:
@@ -201,7 +260,10 @@ def save_tile_catalog(project_dir: Path, project_name: str, tile: str, catalog: 
         # Load existing FITS file to preserve header information
         with fits.open(catalog_path) as hdul:
             primary_hdu = hdul[0].copy()  # Preserve primary header
-        
+        for key in CORRECTION_STATE_KEYS:
+            applied = catalog.meta.get(key, [])
+            primary_hdu.header[key] = (','.join(applied), 'filters with this correction applied')
+
         # Create new table HDU with updated catalog
         table_hdu = fits.BinTableHDU(catalog, name='SOURCES')
         
@@ -458,6 +520,8 @@ def compute_aper_photometry(
     col_suffix = 'hom' if homogenized else 'nat'
     ctx.catalog[f'f_aper_{col_suffix}_{filter_name}'] = flux
     ctx.catalog[f'e_aper_{col_suffix}_{filter_name}'] = fluxerr
+    if homogenized:
+        _mark_raw(ctx.catalog, 'APERCORR', filter_name)
     
     logger.debug(f"        Added columns {f'f_aper_{col_suffix}_{filter_name}'}, {f'e_aper_{col_suffix}_{filter_name}'}")
 
@@ -626,6 +690,7 @@ def compute_auto_photometry(
     # Add results to catalog (store aperture fluxes as 2D array with columns = aperture sizes)
     ctx.catalog[f'f_auto_{filter_name}'] = flux
     ctx.catalog[f'e_auto_{filter_name}'] = fluxerr
+    _mark_raw(ctx.catalog, 'KRONCORR', filter_name)
 
     logger.debug(f"        Added columns {f'f_auto_{filter_name}'}, {f'e_auto_{filter_name}'}")
     return ctx.catalog
@@ -734,13 +799,12 @@ def apply_kron_corr(
     # Flag sources that hit the upper bound (likely blended)
     flag_blend = (kron_corr == kron_corr_bounds[1])
     
-    # Apply correction to all AUTO photometry columns
-    n_corrected = 0
-    for col in ctx.catalog.colnames:
-        if col.startswith('f_auto_') or col.startswith('e_auto_'):
-            ctx.catalog[col] *= kron_corr
-            n_corrected += 1
-    
+    # Apply correction to all AUTO photometry columns (idempotently: columns corrected by a
+    # previous run are first divided by that run's kron_corr, F03)
+    old_corr = np.asarray(ctx.catalog['kron_corr'], dtype=float) if 'kron_corr' in ctx.catalog.colnames else None
+    corrected = _apply_multiplicative_correction(ctx.catalog, ('f_auto_', 'e_auto_'), kron_corr, old_corr, 'KRONCORR')
+    n_corrected = 2 * len(corrected)
+
     # Store correction information in catalog
     ctx.catalog['kron_corr'] = kron_corr
     ctx.catalog['flag_blend'] = flag_blend
@@ -941,12 +1005,10 @@ def apply_aper_corr(
     # Gate on S/N, apply bounds, flag (F01)
     aper_corr, flag_aper_corr = _finalize_aper_corr(aper_corr, snr1, aper_corr_bounds, aper_corr_min_snr)
 
-    # Apply correction to all APER_HOM photometry columns
-    n_corrected = 0
-    for col in ctx.catalog.colnames:
-        if col.startswith('f_aper_hom_') or col.startswith('e_aper_hom_'):
-            ctx.catalog[col] *= aper_corr
-            n_corrected += 1
+    # Apply correction to all APER_HOM photometry columns (idempotently, see F03 above)
+    old_corr = np.asarray(ctx.catalog['aper_corr'], dtype=float) if 'aper_corr' in ctx.catalog.colnames else None
+    corrected = _apply_multiplicative_correction(ctx.catalog, ('f_aper_hom_', 'e_aper_hom_'), aper_corr, old_corr, 'APERCORR')
+    n_corrected = 2 * len(corrected)
 
     # Store correction information in catalog
     ctx.catalog['aper_corr'] = aper_corr
