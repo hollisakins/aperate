@@ -765,30 +765,25 @@ def apply_psf_corrections(
     """
     logger = get_logger()
 
+    # Every filter is corrected with the TARGET filter's aperture-to-total grid. Homogenized
+    # filters are measured on images convolved to the target PSF; inverse filters (broader PSF
+    # than the target) are measured on their native image and then scaled at photometry time by
+    # the per-source factor flux(target, native) / flux(target, convolved to this filter), which
+    # already brings them to the target resolution. Using the inverse filter's own grid here
+    # applied that correction a second time (F17 in the 2026-10 review: F770W fluxes +15%).
+    target = psfs_config.target_filter
     for filt in filters:
         logger.info(filt)
-        if filt in psfs_config.inverse_filters:
-            if psfs_config.master_psf:
-                logger.debug(f'{filt} - master PSF')
-                psf_corr_file = psf_correction_dir / f'{filt}_psf_corr_grid.txt'
-                catalog = _apply_psf_corr(catalog, filt, 'all', psf_corr_file, aperture_diameters)
-            else:
-                logger.debug(f'{filt} - per-tile PSF')
-                for tile in tiles:
-                    logger.debug(f'{filt} - {tile}')
-                    psf_corr_file = psf_correction_dir / f'{filt}_{tile}_psf_corr_grid.txt'
-                    catalog = _apply_psf_corr(catalog, filt, tile, psf_corr_file, aperture_diameters)
+        if psfs_config.master_psf:
+            logger.debug(f'{filt} - master PSF ({target} grid)')
+            psf_corr_file = psf_correction_dir / f'{target}_psf_corr_grid.txt'
+            catalog = _apply_psf_corr(catalog, filt, 'all', psf_corr_file, aperture_diameters)
         else:
-            if psfs_config.master_psf:
-                logger.debug(f'{filt} - master PSF')
-                psf_corr_file = psf_correction_dir / f'{psfs_config.target_filter}_psf_corr_grid.txt'
-                catalog = _apply_psf_corr(catalog, filt, 'all', psf_corr_file, aperture_diameters)
-            else:
-                logger.debug(f'{filt} - per-tile PSF')
-                for tile in tiles:
-                    logger.debug(f'{filt} - {tile}')
-                    psf_corr_file = psf_correction_dir / f'{psfs_config.target_filter}_{tile}_psf_corr_grid.txt'
-                    catalog = _apply_psf_corr(catalog, filt, tile, psf_corr_file, aperture_diameters)
+            logger.debug(f'{filt} - per-tile PSF ({target} grids)')
+            for tile in tiles:
+                logger.debug(f'{filt} - {tile}')
+                psf_corr_file = psf_correction_dir / f'{target}_{tile}_psf_corr_grid.txt'
+                catalog = _apply_psf_corr(catalog, filt, tile, psf_corr_file, aperture_diameters)
 
     return catalog
 
