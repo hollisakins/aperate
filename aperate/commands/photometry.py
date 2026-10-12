@@ -25,7 +25,6 @@ from ..utils.helpers import get_unit_conversion
 from astropy.wcs import FITSFixedWarning
 warnings.simplefilter('ignore', category=FITSFixedWarning)
 
-from photutils.aperture import CircularAperture, ApertureStats
 import sep
 
 @dataclass
@@ -47,15 +46,23 @@ class PhotometryContext:
     overwrite: bool
     _image_cache: Dict[str, np.ndarray] = field(default_factory=dict, repr=False)
     _flux_cache: Dict[str, object] = field(default_factory=dict, repr=False)
+    _persistent: set = field(default_factory=set, repr=False)
 
-    def load_image(self, path, hdu_index=0) -> np.ndarray:
-        """Load a FITS image with byteorder conversion, caching by path and HDU."""
+    def load_image(self, path, hdu_index=0, persistent=False) -> np.ndarray:
+        """Load a FITS image with byteorder conversion, caching by path and HDU.
+
+        persistent=True keeps the array across clear_image_cache() calls; used for images that
+        every filter needs again (the target filter's native image for the inverse-filter
+        corrections), so a tile reads them once instead of once per filter (F10).
+        """
         key = f'{path}#{hdu_index}'
         if key not in self._image_cache:
             with fits.open(path) as hdul:
                 data = hdul[hdu_index].data
                 data = data.astype(data.dtype.newbyteorder('='))
             self._image_cache[key] = data
+        if persistent:
+            self._persistent.add(key)
         return self._image_cache[key]
 
     def load_error(self, image_files) -> np.ndarray:
@@ -74,9 +81,13 @@ class PhotometryContext:
         else:
             return None
 
-    def clear_image_cache(self):
-        """Free cached image arrays."""
-        self._image_cache.clear()
+    def clear_image_cache(self, all=False):
+        """Free cached image arrays (except the persistent ones unless all=True)."""
+        for key in list(self._image_cache):
+            if all or key not in self._persistent:
+                del self._image_cache[key]
+        if all:
+            self._persistent.clear()
 
     def get_image_files(self, filter_name: str) -> Optional[ImageFiles]:
         """Get image files for any filter in the current tile.
@@ -277,48 +288,60 @@ def save_tile_catalog(project_dir: Path, project_name: str, tile: str, catalog: 
         raise
 
 
-def compute_weights(catalog: Table, image_files, filter_name: str, windowed: bool) -> Table:
+def _local_median(image: np.ndarray, x_pos, y_pos, r: float = 5.0, chunk: int = 200000) -> np.ndarray:
+    """Median of the finite pixels whose centres lie within r pixels of each position.
+
+    Vectorised gather over the (2r+1)^2 offsets, in chunks of sources; equivalent to the
+    per-source cutout median of photutils.ApertureStats but ~100x faster (F10).
     """
-    Compute median weight values at source positions.
-    
-    Extracts the median value of the weight map at the position of each source
-    and stores it in a new column named 'weight_{filter_name}'.
-    Uses windowed positions (xwin, ywin) if windowed=True, otherwise uses (x, y).
-    
-    Args:
-        catalog: Source catalog table
-        image_files: ImageFiles object containing file paths
-        filter_name: Filter name for column naming
-        windowed: Whether to use windowed positions
-        
-    Returns:
-        Updated catalog with weight column
+    ri = int(np.ceil(r))
+    dy, dx = np.mgrid[-ri:ri + 1, -ri:ri + 1]
+    inside = (dx ** 2 + dy ** 2) <= r ** 2
+    dx, dy = dx[inside], dy[inside]
+    ny, nx = image.shape
+    xi = np.round(np.asarray(x_pos, dtype=float)).astype(int)
+    yi = np.round(np.asarray(y_pos, dtype=float)).astype(int)
+    out = np.full(len(xi), np.nan)
+    for s in range(0, len(xi), chunk):
+        xx = xi[s:s + chunk, None] + dx[None, :]
+        yy = yi[s:s + chunk, None] + dy[None, :]
+        ok = (xx >= 0) & (xx < nx) & (yy >= 0) & (yy < ny)
+        vals = np.full(xx.shape, np.nan)
+        vals[ok] = image[yy[ok], xx[ok]]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            out[s:s + chunk] = np.nanmedian(vals, axis=1)
+    return out
+
+
+def compute_weights(ctx: PhotometryContext, filter_name: str, image_files) -> Table:
     """
-    logger = get_logger()
-    logger.debug(f"        Computing weights for {filter_name} (windowed={windowed})")
-    
-    # Get source positions using helper function
-    x_pos, y_pos = get_source_positions(catalog, windowed)
-    
+    Compute the local weight and rms values at source positions.
+
+    Stores the median of the weight map (and of the rms map, when present) within r = 5 px of
+    each source in 'wht_{filter_name}' / 'rms_{filter_name}'; these are the per-object scale of
+    the error model applied in postprocess. The median is computed with a vectorised gather
+    instead of photutils.ApertureStats (20-30 s per filter and tile before, F10), and the maps
+    go through the context cache so that the error map derived from the weight map does not
+    read the file a second time.
+    """
+    logger = ctx.get_logger()
+    logger.debug(f"        Computing weights for {filter_name} (windowed={ctx.windowed})")
+    x_pos, y_pos = get_source_positions(ctx.catalog, ctx.windowed)
+
     if image_files.has_extension('wht'):
-        wht_path = image_files.get_weight_path()
-        with fits.open(wht_path) as hdul:
-            aperture = CircularAperture(np.array([x_pos, y_pos]).T, r=5)
-            aperstats = ApertureStats(hdul[0].data, aperture)
-            catalog[f'wht_{filter_name}'] = aperstats.median
+        wht = ctx.load_image(image_files.get_weight_path())
+        ctx.catalog[f'wht_{filter_name}'] = _local_median(wht, x_pos, y_pos)
     else:
         logger.warning(f"        Could not find weight map for {filter_name}")
-    
+
     if image_files.has_extension('rms'):
-        rms_path = image_files.get_rms_path()
-        with fits.open(rms_path) as hdul:
-            aperture = CircularAperture(np.array([x_pos, y_pos]).T, r=5)
-            aperstats = ApertureStats(hdul[0].data, aperture)
-            catalog[f'rms_{filter_name}'] = aperstats.median
+        rms = ctx.load_image(image_files.get_rms_path())
+        ctx.catalog[f'rms_{filter_name}'] = _local_median(rms, x_pos, y_pos)
     else:
         logger.warning(f"        Could not find rms map for {filter_name}")
-    
-    return catalog
+
+    return ctx.catalog
 
 def compute_rhalf(ctx: PhotometryContext, filter_name: str, image_files) -> Table:
     """
@@ -465,7 +488,7 @@ def compute_aper_photometry(
 
             if target_hom_path and target_hom_path.exists():
                 hom_data = ctx.load_image(target_hom_path)
-                sci_data = ctx.load_image(target_sci_path)
+                sci_data = ctx.load_image(target_sci_path, persistent=True)
                 corr_mask = ~np.isfinite(hom_data)
 
                 flux1_list = []
@@ -651,7 +674,7 @@ def compute_auto_photometry(
 
             if target_hom_path and target_hom_path.exists():
                 hom_data = ctx.load_image(target_hom_path)
-                sci_data = ctx.load_image(target_sci_path)
+                sci_data = ctx.load_image(target_sci_path, persistent=True)
                 corr_mask = ~np.isfinite(hom_data)
 
                 flux1, _, _, _, _ = _compute_auto_photometry(
@@ -1056,7 +1079,7 @@ def process_photometry_for_filter(ctx: PhotometryContext, filter_name: str) -> T
         logger.debug(f"        Filter {filter_name}: is_target={ctx.is_target_filter(filter_name)}, is_inverse={ctx.is_inverse_filter(filter_name)}")
     
     # Always compute weights and RMS (basic measurements)
-    ctx.catalog = compute_weights(ctx.catalog, image_files, filter_name, ctx.windowed)
+    ctx.catalog = compute_weights(ctx, filter_name, image_files)
     # note: removed compute_rms as its included within compute_weights now
     
     # Compute half-light radii if requested

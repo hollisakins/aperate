@@ -24,6 +24,7 @@ from ..utils.helpers import get_unit_conversion
 from .detect import fit_pixel_dist
 
 import pickle
+import sep
 from scipy.optimize import curve_fit
 from photutils.aperture import EllipticalAperture, CircularAperture, aperture_photometry
 from astropy.wcs import WCS, FITSFixedWarning
@@ -355,43 +356,57 @@ def measure_random_apertures(
                         nsci = sci/rms
 
                     nsci[(rms <= 0)|~np.isfinite(rms)] = np.nan
-
-                    nsci_random = np.random.normal(loc=0, scale=rms1_random, size=nsci.shape)
+                    del rms
 
                     pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
 
-                    n_valid_pixels = np.sum(np.isfinite(nsci))
+                    valid = np.isfinite(nsci)
+                    n_valid_pixels = int(valid.sum())
                     if n_valid_pixels == 0:
                         logger.warning(f'{filt} {tile}: no valid pixels, skipping in random apertures')
                         continue
                     area = n_valid_pixels * pixel_scale**2 / 3600
+                    ny, nx = nsci.shape
 
-                    x, y = np.arange(np.shape(nsci)[1]), np.arange(np.shape(nsci)[0])
-                    x, y = np.meshgrid(x, y)
-                    x, y = x.flatten(), y.flatten()
-                    x = x[np.isfinite(nsci.flatten())]
-                    y = y[np.isfinite(nsci.flatten())]
+                    # sep needs finite, native-order float32 data; invalid pixels are masked and any
+                    # aperture touching one is discarded (as the NaN sums were before)
+                    nsci = np.ascontiguousarray(np.where(valid, nsci, 0).astype(np.float32))
+                    invalid = np.ascontiguousarray((~valid).astype(np.float32))
+                    nsci_random = np.ascontiguousarray(
+                        np.random.normal(loc=0, scale=rms1_random, size=nsci.shape).astype(np.float32))
 
                     for i in range(num_radii):
                         diameter = aperture_diameters[i]
+                        r_pix = diameter/2/pixel_scale
                         Nap = int(num_apertures_per_sq_arcmin * area)
-                        if diameter > 1.0: 
+                        if diameter > 1.0:
                             Nap = int(Nap * 0.25/(diameter/2)**2)
                         if Nap/area < min_num_apertures_per_sq_arcmin:
                             Nap = int(min_num_apertures_per_sq_arcmin * area)
-                            
-                        idx = np.random.randint(low=0,high=len(x),size=Nap)
-                        xi, yi = x[idx].astype(float), y[idx].astype(float)
-                        xi += np.random.normal(loc=0, scale=1, size=Nap)
-                        yi += np.random.normal(loc=0, scale=1, size=Nap)
 
-                        apertures = CircularAperture(np.array([xi,yi]).T, r=diameter/2/pixel_scale)
+                        # Random positions on valid pixels (rejection sampling instead of listing
+                        # every valid pixel of the tile, which needed ~10 GB for a 480 Mpx mosaic)
+                        xi = np.empty(0); yi = np.empty(0)
+                        n_draw = int(Nap / max(n_valid_pixels / nsci.size, 0.01)) + 1000
+                        for _ in range(20):
+                            xd = np.random.uniform(r_pix, nx - 1 - r_pix, n_draw)
+                            yd = np.random.uniform(r_pix, ny - 1 - r_pix, n_draw)
+                            ok = valid[np.round(yd).astype(int), np.round(xd).astype(int)]
+                            xi = np.concatenate([xi, xd[ok]]); yi = np.concatenate([yi, yd[ok]])
+                            if len(xi) >= Nap:
+                                break
+                        xi, yi = xi[:Nap], yi[:Nap]
 
-                        tbl = aperture_photometry(nsci, apertures, method='subpixel', subpixels=5)
-                        fluxes[i].extend(list(tbl['aperture_sum']))
-                        
-                        tbl = aperture_photometry(nsci_random, apertures, method='subpixel', subpixels=5)
-                        fluxes_random[i].extend(list(tbl['aperture_sum']))
+                        # sep.sum_circle with subpix=5 matches photutils' subpixel method (F10:
+                        # ~100x faster per aperture)
+                        f, _, _ = sep.sum_circle(nsci, xi, yi, r_pix, subpix=5)
+                        nbad, _, _ = sep.sum_circle(invalid, xi, yi, r_pix, subpix=5)
+                        f[nbad > 0] = np.nan
+                        fluxes[i].extend(list(f))
+
+                        f, _, _ = sep.sum_circle(nsci_random, xi, yi, r_pix, subpix=5)
+                        fluxes_random[i].extend(list(f))
+                    del nsci, nsci_random, invalid, valid
                 
                 logger.info('Fitting distribution')
                 rmsN = np.zeros(num_radii)
