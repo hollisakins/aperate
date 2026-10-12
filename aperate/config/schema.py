@@ -318,12 +318,28 @@ class MergeTilesConfig(_Section):
 
 
 class RandomAperturesConfig(_Section):
-    """Random apertures (error calibration) configuration."""
+    """Random apertures (error calibration) configuration.
+
+    The error model is sigma = sigma1 * c_s(sqrt N) * S(x): one empirical curve c_s per depth
+    stratum s (depth_strata quantile bins of the depth proxy, plus tail bins), times a per-pixel
+    scale S. depth_strata = 1 is the single-curve model of earlier versions.
+    """
     run: bool = True
     min_radius: float = 0.05   # arcsec
     max_radius: float = 1.50   # arcsec
     num_radii: int = 40
     num_apertures_per_sq_arcmin: int = 100
+    depth_strata: int = 8
+    # depth proxy: 'wht' (weight map, used only to order pixels by depth), 'rms', or 'empirical'
+    # (noise map measured from the source-masked image); 'auto' = wht if present, else rms, else empirical
+    depth_proxy: Literal['auto', 'wht', 'rms', 'empirical'] = 'auto'
+    # per-pixel scale: 'rms' map, 'wht' (1/sqrt(wht)) or 'empirical'; 'auto' = rms, else wht, else empirical
+    scale_map: Literal['auto', 'rms', 'wht', 'empirical'] = 'auto'
+    mask_sources: bool = True          # apertures avoid the segmentation map
+    mask_dilate: int = 3               # pixels added around sources and invalid pixels
+    holdout_fraction: float = 0.2      # apertures kept back to report the calibration
+    check_weight_map: bool = True      # compare the weight map with the empirical noise before trusting it
+    parallel: int = 1                  # tiles sampled in parallel (processes)
 
     @model_validator(mode='after')
     def _ranges(self):
@@ -333,6 +349,14 @@ class RandomAperturesConfig(_Section):
             raise ValueError('num_radii must be >= 2')
         if self.num_apertures_per_sq_arcmin < 1:
             raise ValueError('num_apertures_per_sq_arcmin must be >= 1')
+        if self.depth_strata < 1:
+            raise ValueError('depth_strata must be >= 1')
+        if self.mask_dilate < 0:
+            raise ValueError('mask_dilate must be >= 0')
+        if not 0 <= self.holdout_fraction < 0.5:
+            raise ValueError('holdout_fraction must be in [0, 0.5)')
+        if self.parallel < 1:
+            raise ValueError('parallel must be >= 1')
         return self
 
 

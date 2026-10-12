@@ -81,6 +81,14 @@ class PhotometryContext:
         else:
             return None
 
+    def ones_image(self, shape) -> np.ndarray:
+        """A persistent float32 image of ones (for counting the pixels sep sums)."""
+        key = f'ones#{shape[0]}x{shape[1]}'
+        if key not in self._image_cache:
+            self._image_cache[key] = np.ones(shape, dtype=np.float32)
+            self._persistent.add(key)
+        return self._image_cache[key]
+
     def clear_image_cache(self, all=False):
         """Free cached image arrays (except the persistent ones unless all=True)."""
         for key in list(self._image_cache):
@@ -467,6 +475,14 @@ def compute_aper_photometry(
     flux = np.column_stack(flux_list)
     fluxerr = np.column_stack(fluxerr_list)
 
+    # Number of pixels actually summed (invalid pixels and other segments excluded): the
+    # aperture size the error model uses (postprocess)
+    ones = ctx.ones_image(sci.shape)
+    npix = np.column_stack([
+        sep.sum_circle(ones, x_pos, y_pos, diam_pix / 2, mask=mask, segmap=ctx.segmap, seg_id=ctx.catalog['id'])[0]
+        for diam_pix in aperture_diameters_pixels])
+    ctx.catalog[f"npix_aper_{'hom' if homogenized else 'nat'}_{filter_name}"] = np.round(npix).astype(np.int32)
+
     # Cache raw (pre-unit-conversion) aperture fluxes for aper_corr reuse
     if homogenized and ctx.photometry_config.aperture.aper_corr:
         aper_corr_filter = ctx.photometry_config.aperture.aper_corr_filter
@@ -643,6 +659,10 @@ def compute_auto_photometry(
 
     # Run the auto photometry calculation
     flux, fluxerr, flag, a, b = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
+    # Number of pixels actually summed in the Kron aperture (same mask and segment exclusion):
+    # the aperture size the error model uses (postprocess)
+    npix, _, _, _, _ = _compute_auto_photometry(ctx.ones_image(sci.shape), None, mask, x_pos, y_pos, ctx, kron_params)
+    ctx.catalog[f'npix_auto_{filter_name}'] = np.round(npix).astype(np.int32)
 
     # Cache raw (pre-unit-conversion) auto flux for kron_corr and aper_corr reuse
     # Use filter-specific keys since kron_corr_filter and aper_corr_filter may differ
