@@ -16,6 +16,7 @@ dependencies = [
     "astropy>=5.0.0",
     "sep>=1.2.0",
     "photutils>=1.5.0",
+    "pydantic>=2.0",
     "tomli>=2.0.0; python_version<'3.11'",
     "toml>=0.10.0",
 ]
