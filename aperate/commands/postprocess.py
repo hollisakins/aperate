@@ -826,7 +826,14 @@ def set_missing_to_nan(catalog, filters):
 
         for phot_type in ['auto','aper_nat','aper_hom']:
             if f'f_{phot_type}_{filt}' in catalog.columns:
-                cond = ~np.isfinite(catalog[f'f_{phot_type}_{filt}']) | (catalog[f'f_{phot_type}_{filt}'] == 0) | ~np.isfinite(catalog[f'e_{phot_type}_{filt}_uncal']) | (catalog[f'e_{phot_type}_{filt}_uncal'] == 0)
+                f = catalog[f'f_{phot_type}_{filt}']
+                e_uncal = catalog[f'e_{phot_type}_{filt}_uncal']
+                cond = ~np.isfinite(f) | (f == 0) | ~np.isfinite(e_uncal) | (e_uncal == 0)
+                # A calibrated error that is not finite or not positive marks an entry whose
+                # correction factors were undefined or negative (F01): no usable measurement.
+                e = catalog[f'e_{phot_type}_{filt}']
+                with np.errstate(invalid='ignore'):
+                    cond |= ~np.isfinite(e) | (e <= 0)
                 catalog[f'f_{phot_type}_{filt}'][cond] = np.nan
                 catalog[f'e_{phot_type}_{filt}'][cond] = np.nan
                 catalog[f'e_{phot_type}_{filt}_uncal'][cond] = np.nan

@@ -121,6 +121,10 @@ class AperturePhotometryConfig:
     aper_corr_filter: str = 'detection'
     aper_corr_bounds: List[float] = field(default_factory=lambda: [1.0, 5.0])
     aper_corr_params: List[float] = field(default_factory=lambda: [2.5, 3.5])
+    # Minimum S/N of the fixed-aperture flux on the aper_corr image for a correction to be
+    # applied; below it the corrected flux is NaN (the ratio of two noisy fluxes is not a
+    # correction). Values outside aper_corr_bounds are flagged (flag_aper_corr bit 2), not clipped.
+    aper_corr_min_snr: float = 3.0
 
 
 @dataclass
@@ -396,7 +400,8 @@ class AperateConfig:
             aper_corr=aper_data.get('aper_corr', False),
             aper_corr_filter=aper_data.get('aper_corr_filter', 'detection'),
             aper_corr_bounds=aper_data.get('aper_corr_bounds', [1.0, 5.0]),
-            aper_corr_params=aper_data.get('aper_corr_params', [2.5, 3.5])
+            aper_corr_params=aper_data.get('aper_corr_params', [2.5, 3.5]),
+            aper_corr_min_snr=aper_data.get('aper_corr_min_snr', 3.0),
         )
         
         auto = AutoPhotometryConfig(

@@ -49,8 +49,8 @@ class PhotometryContext:
     _flux_cache: Dict[str, object] = field(default_factory=dict, repr=False)
 
     def load_image(self, path, hdu_index=0) -> np.ndarray:
-        """Load a FITS image with byteorder conversion, caching by path."""
-        key = str(path)
+        """Load a FITS image with byteorder conversion, caching by path and HDU."""
+        key = f'{path}#{hdu_index}'
         if key not in self._image_cache:
             with fits.open(path) as hdul:
                 data = hdul[hdu_index].data
@@ -426,8 +426,15 @@ def compute_aper_photometry(
                 flux1 = np.column_stack(flux1_list)
                 flux2 = np.column_stack(flux2_list)
 
-                # Correction factor for flux lost due to larger PSF
-                corr_fact = flux2 / flux1
+                # Correction factor for flux lost due to larger PSF. As in the AUTO path: the
+                # ratio is positive by definition, so take abs() (a negative value, from a
+                # noise-dominated flux1 or flux2, would flip the sign of flux and error) and
+                # leave the flux unchanged where the ratio is undefined. (F01; the factor
+                # itself remains a ratio of noisy fluxes for faint sources -- review F09.)
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)
+                    corr_fact = np.abs(flux2 / flux1)
+                corr_fact = np.where(np.isfinite(corr_fact), corr_fact, 1.0)
                 flux *= corr_fact
                 fluxerr *= corr_fact
 
@@ -753,18 +760,48 @@ def apply_kron_corr(
     logger.info(f"  Correction range: [{np.min(kron_corr):.3f}, {np.max(kron_corr):.3f}]")
 
 
+def _finalize_aper_corr(aper_corr, snr, bounds, min_snr):
+    """Gate and bound the per-source aperture corrections (review finding F01).
+
+    aper_corr: (n_src, n_diam) ratio AUTO / fixed-aperture flux on the correction image
+    snr:       (n_src, n_diam) S/N of the fixed-aperture flux that forms the denominator
+    Returns (aper_corr, flag) where flag is an int16 array with bit 1 set where the ratio was
+    not applied (denominator below min_snr, or undefined -> aper_corr NaN) and bit 2 where it
+    lies outside bounds (flagged, not clipped: the plausible range depends strongly on the
+    aperture diameter -- on the review cutout the 5-95% range is 15-190 at 0.05" and 0.8-1.8
+    at 1.0" -- so one pair of bounds cannot be a clip for all diameters). The S/N gate is what
+    removes the noise-dominated ratios: in cosmos_v1.3 the ungated ratio was negative for
+    0.7-2.8% of entries, sign-flipping flux and error.
+    """
+    aper_corr = np.array(aper_corr, dtype=float)
+    snr = np.asarray(snr, dtype=float)
+    flag = np.zeros(aper_corr.shape, dtype=np.int16)
+    with np.errstate(invalid='ignore'):
+        low = ~np.isfinite(aper_corr) | ~np.isfinite(snr) | (snr < min_snr)
+        out = np.isfinite(aper_corr) & ((aper_corr < bounds[0]) | (aper_corr > bounds[1]))
+    flag[low] |= 1
+    flag[out & ~low] |= 2
+    aper_corr[low] = np.nan
+    return aper_corr, flag
+
+
 def apply_aper_corr(
     ctx: PhotometryContext,
     aper_corr_filter: str,
     kron_params: List[float],
     aper_corr_bounds: List[float],
-    aperture_diameters: List[float]
+    aperture_diameters: List[float],
+    aper_corr_min_snr: float = 3.0,
 ) -> None:
     """
     Apply aperture correction to PSF-homogenized aperture photometry measurements.
-    
+
     Computes aperture photometry and Kron photometry on the same image and uses the flux ratio
-    to correct for flux missed in fixed apertures.
+    to correct for flux missed in fixed apertures. The correction is applied only where the
+    fixed-aperture flux on the correction image has S/N >= aper_corr_min_snr (otherwise the
+    corrected flux and error are NaN); values outside aper_corr_bounds are flagged but kept.
+    Both cases are recorded in the 'flag_aper_corr' column (bit 1: not applied, bit 2: outside
+    bounds).
     """
     logger = ctx.get_logger()
     logger.info(f"Applying aperture correction using {aper_corr_filter}")
@@ -786,18 +823,23 @@ def apply_aper_corr(
 
         logger.debug(f"Using detection image: {det_path}")
         sci = ctx.load_image(det_path, hdu_index=1)
-        mask = ~np.isfinite(sci)
-        err = None
-
-        # Get pixel scale from header
+        # The detection image carries its error map in HDU 2 (see detect.py); it gives the
+        # S/N of the fixed-aperture flux that the correction divides by.
         with fits.open(det_path) as det_hdul:
             header = det_hdul[1].header
             pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
+            has_err = len(det_hdul) > 2 and det_hdul[2].data is not None
+        err = ctx.load_image(det_path, hdu_index=2) if has_err else None
+        if err is None:
+            logger.warning("Detection image has no error HDU: aperture-correction S/N gate disabled")
+        mask = ~np.isfinite(sci)
+        if err is not None:
+            mask |= ~np.isfinite(err)
 
         # Convert aperture diameters from arcsec to pixels
         aperture_diameters_pixels = np.array(aperture_diameters) / pixel_scale
 
-        flux_list = []
+        flux_list, fluxerr_list = [], []
         for diam_pix in aperture_diameters_pixels:
             flux_i, fluxerr_i, flag = sep.sum_circle(
                 sci, x_pos, y_pos,
@@ -808,9 +850,11 @@ def apply_aper_corr(
                 seg_id=ctx.catalog['id'],
             )
             flux_list.append(flux_i)
+            fluxerr_list.append(fluxerr_i)
 
         flux1 = np.column_stack(flux_list)
-        flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
+        fluxerr1 = np.column_stack(fluxerr_list) if err is not None else None
+        flux2, _, _, a2, b2 = _compute_auto_photometry(sci, None, mask, x_pos, y_pos, ctx, kron_params)
 
     else:
         # Reuse fluxes cached by the main photometry pass where they are valid:
@@ -876,27 +920,48 @@ def apply_aper_corr(
             # AUTO flux with the aperture-correction Kron parameters (not auto.kron_params)
             flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
 
-    # Calculate correction factor
-    aper_corr = flux2[:, np.newaxis] / flux1
-    
-    # Apply bounds to correction factor
-    # aper_corr = np.clip(aper_corr, aper_corr_bounds[0], aper_corr_bounds[1])
-    
+        fluxerr1 = None
+
+    # S/N of the denominator (fixed-aperture flux on the correction image)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        if fluxerr1 is not None:
+            snr1 = flux1 / fluxerr1
+        elif (f'f_aper_hom_{aper_corr_filter}' in ctx.catalog.colnames
+              and f'e_aper_hom_{aper_corr_filter}' in ctx.catalog.colnames):
+            # same apertures on the same image, already in catalog units
+            snr1 = np.asarray(ctx.catalog[f'f_aper_hom_{aper_corr_filter}']) / np.asarray(ctx.catalog[f'e_aper_hom_{aper_corr_filter}'])
+        else:
+            logger.warning("No error available for the aperture-correction denominator: S/N gate disabled")
+            snr1 = np.full(flux1.shape, np.inf)
+
+        # Calculate correction factor
+        aper_corr = flux2[:, np.newaxis] / flux1
+
+    # Gate on S/N, apply bounds, flag (F01)
+    aper_corr, flag_aper_corr = _finalize_aper_corr(aper_corr, snr1, aper_corr_bounds, aper_corr_min_snr)
+
     # Apply correction to all APER_HOM photometry columns
     n_corrected = 0
     for col in ctx.catalog.colnames:
         if col.startswith('f_aper_hom_') or col.startswith('e_aper_hom_'):
             ctx.catalog[col] *= aper_corr
             n_corrected += 1
-    
+
     # Store correction information in catalog
     ctx.catalog['aper_corr'] = aper_corr
-    
+    ctx.catalog['flag_aper_corr'] = flag_aper_corr
+
     # Log summary statistics
     median_corr = np.nanmedian(aper_corr)
     isnan = np.sum(np.isnan(aper_corr))
-    # n_at_bound = np.sum(aper_corr == aper_corr_bounds[1])
+    frac_low = np.mean(flag_aper_corr & 1, axis=0)
+    frac_out = np.mean((flag_aper_corr & 2) > 0, axis=0)
     logger.info(f"Aperture correction applied to {n_corrected} columns")
+    logger.info("  Not applied (S/N < %.1f) per diameter: %s", aper_corr_min_snr,
+                ', '.join(f'{d}"={100*f:.1f}%' for d, f in zip(aperture_diameters, frac_low)))
+    logger.info("  Flagged outside bounds %s per diameter: %s", list(aper_corr_bounds),
+                ', '.join(f'{d}"={100*f:.1f}%' for d, f in zip(aperture_diameters, frac_out)))
     logger.info(f"  Median correction: {median_corr:.3f}")
     logger.info(f"  Percent nan: {isnan/aper_corr.size*100:.1f}%")
     # logger.info(f"  Sources at upper bound: {n_at_bound}/{len(aper_corr)} ({100*n_at_bound/len(aper_corr):.1f}%)")
@@ -1036,7 +1101,8 @@ def process_photometry_tile(project_dir, tile, filters_to_process, config, image
                 ctx.photometry_config.aperture.aper_corr_filter,
                 ctx.photometry_config.aperture.aper_corr_params,
                 ctx.photometry_config.aperture.aper_corr_bounds,
-                ctx.photometry_config.aperture.diameters
+                ctx.photometry_config.aperture.diameters,
+                ctx.photometry_config.aperture.aper_corr_min_snr,
             )
         
         # Save updated catalog
