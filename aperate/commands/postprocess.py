@@ -184,6 +184,15 @@ def merge_tile_catalogs(
     return catalog_merged
 
 
+def load_map(path) -> np.ndarray:
+    """Data of the first HDU that has any (a plain image or a compressed image extension)."""
+    with fits.open(path) as hdul:
+        for hdu in hdul:
+            if hdu.data is not None and np.ndim(hdu.data) >= 2:
+                return np.asarray(hdu.data)
+    raise ValueError(f'{path}: no image HDU')
+
+
 def _random_aperture_products(output_dir: Path, filt: str, homogenized: bool):
     suffix = '_psfhom' if homogenized else ''
     base = output_dir / f'random_apertures_{filt}{suffix}'
@@ -213,13 +222,12 @@ def _sample_tile_task(args):
     Returns the normalised sums per radius, the log depth proxies (one array per available proxy
     map) and a pixel sample; see aperate.core.noise_curves.sample_image.
     """
-    (sci_path, rms_path, wht_path, segmap_path, scale_kind, proxy_kind, check_wht, diameters, pixel_scale,
+    (sci_path, rms_path, wht_path, nexp_path, segmap_path, scale_kind, proxy_kind, check_wht, diameters, pixel_scale,
      density, min_density, mask_dilate, seed, source_positions, balance_bins) = args
     from ..core import noise_curves as nc
 
     def load(path):
-        with fits.open(path) as hdul:
-            return np.ascontiguousarray(hdul[0].data.astype(np.float32))
+        return np.ascontiguousarray(load_map(path).astype(np.float32))
 
     sci = load(sci_path)
     valid = np.isfinite(sci)
@@ -230,6 +238,11 @@ def _sample_tile_task(args):
     if wht_path is not None and (scale_kind == 'wht' or proxy_kind == 'wht' or check_wht):
         maps['wht'] = load(wht_path)
         valid &= np.isfinite(maps['wht']) & (maps['wht'] > 0)
+    if nexp_path is not None:
+        maps['nexp'] = load(nexp_path)
+        if maps['nexp'].shape != sci.shape:
+            raise ValueError(f'{nexp_path}: the exposure-count map has shape {maps["nexp"].shape}, the image {sci.shape}')
+        valid &= np.isfinite(maps['nexp']) & (maps['nexp'] > 0)
     source_mask = None
     if segmap_path is not None:
         source_mask = np.asarray(fits.getdata(segmap_path)) > 0
@@ -244,7 +257,7 @@ def _sample_tile_task(args):
             scale = np.where(valid, 1.0 / np.sqrt(maps['wht']), 0).astype(np.float32)
     else:
         scale = maps[scale_kind]
-    proxies = {k: maps[k] for k in ('wht', 'rms', 'empirical') if k in maps}
+    proxies = {k: maps[k] for k in ('wht', 'rms', 'empirical', 'nexp') if k in maps}
 
     n_valid = int(valid.sum())
     area = n_valid * pixel_scale ** 2 / 3600       # arcmin^2
@@ -291,6 +304,8 @@ def measure_random_apertures(
     parallel: int = 1,
     project_dir: Optional[Path] = None,
     project_name: Optional[str] = None,
+    nexp_groups: int = 5,
+    nexp_strata: int = 4,
 ) -> None:
     """
     Measure random apertures and fit the stratified noise curves for every filter.
@@ -298,9 +313,12 @@ def measure_random_apertures(
     For each filter (and for its PSF-homogenized image when one is used for photometry) the
     apertures of all tiles are pooled and `aperate.core.noise_curves.fit_model` fits one curve
     sigma_N/sigma_1 versus sqrt(N) per depth stratum (depth_strata quantile bins of the depth
-    proxy plus tail bins; depth_strata = 1 is the single-curve model). Apertures avoid the
-    segmentation map (mask_sources) and invalid pixels. 20% of the apertures (holdout_fraction)
-    are kept back to report the calibration of the fitted model per stratum and aperture size
+    proxy plus tail bins; depth_strata = 1 is the single-curve model). When the filter's images
+    have an 'nexp' extension (number of exposures per pixel) the strata are two-dimensional:
+    up to nexp_groups groups of exposure count, each with nexp_strata strata of the depth per
+    exposure (proxy / NEXP); nexp_groups = 1 ignores the map. Apertures avoid the segmentation
+    map (mask_sources) and invalid pixels. 20% of the apertures (holdout_fraction) are kept back
+    to report the calibration of the fitted model per stratum, cell and aperture size
     (random_apertures_<filter>[_psfhom]_validation.json and the check plot).
 
     Maps: scale_map = rms map | 1/sqrt(wht) | empirical noise map (sep.Background of the masked
@@ -318,7 +336,8 @@ def measure_random_apertures(
     logger.info(f"Measuring random apertures for {len(tiles)} tiles x {len(filters)} filters")
     logger.info(f"Aperture range: {min_radius:.3f} - {max_radius:.3f} arcsec ({num_radii} steps)")
     logger.info(f"Density: {num_apertures_per_sq_arcmin} apertures per sq arcmin; depth strata: {depth_strata}; "
-                f"proxy: {depth_proxy}; scale: {scale_map}; parallel: {parallel}")
+                f"proxy: {depth_proxy}; scale: {scale_map}; exposure-count groups: {nexp_groups} x {nexp_strata} strata; "
+                f"parallel: {parallel}")
 
     index = 2
     aperture_diameters = np.power(np.linspace(np.power(min_radius*2, 1/index), np.power(max_radius*2, 1/index), num_radii), index)  # arcsec
@@ -345,7 +364,8 @@ def measure_random_apertures(
                 image_files = images_config.get_image_files(filt, tile)
                 sci_path = image_files.get_homogenized_path(psfs_config.target_filter) if homogenized else image_files.get_science_path()
                 scale_kind, proxy_kind = _resolve_noise_maps(image_files, depth_proxy, scale_map)
-                kinds.add((scale_kind, proxy_kind))
+                has_nexp = nexp_groups > 1 and bool(image_files.has_extension('nexp'))
+                kinds.add((scale_kind, proxy_kind, has_nexp))
                 header = fits.getheader(sci_path)
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore', FITSFixedWarning)
@@ -367,6 +387,7 @@ def measure_random_apertures(
                 tasks.append((str(sci_path),
                               str(image_files.get_rms_path()) if image_files.has_extension('rms') else None,
                               str(image_files.get_weight_path()) if image_files.has_extension('wht') else None,
+                              str(image_files.get_nexp_path()) if has_nexp else None,
                               str(segmap_path) if segmap_path is not None else None,
                               scale_kind, proxy_kind, check_weight_map and proxy_kind == 'wht',
                               aperture_diameters.tolist(), pixel_scale,
@@ -374,7 +395,7 @@ def measure_random_apertures(
                               1000 * n + 7, positions, 12 if depth_strata > 1 else 0))
             if len(kinds) != 1:
                 raise ValueError(f'{filt}: the tiles do not have the same map extensions: {kinds}')
-            scale_kind, proxy_kind = kinds.pop()
+            scale_kind, proxy_kind, has_nexp = kinds.pop()
 
             if parallel > 1 and len(tasks) > 1:
                 import multiprocessing as mp
@@ -413,15 +434,21 @@ def measure_random_apertures(
             samples = {i: {'f': np.concatenate([r['f'][i] for _, r in results]),
                            'logp': np.concatenate([r['logp'][proxy_used][i] for _, r in results])}
                        for i in range(num_radii)}
+            if has_nexp:
+                for i in range(num_radii):
+                    samples[i]['lognexp'] = np.concatenate([r['logp']['nexp'][i] for _, r in results])
             pixel_scale = float(np.median(pixel_scales))
             sqrtN = np.sqrt(np.pi) * aperture_diameters / 2 / pixel_scale
-            logger.info(f'{filt}: fitting {depth_strata} depth strata on {sum(len(s["f"]) for s in samples.values())} apertures')
+            logger.info(f'{filt}: fitting {depth_strata} depth strata'
+                        + (f' and up to {nexp_groups} exposure-count groups x {nexp_strata} strata' if has_nexp else '')
+                        + f' on {sum(len(s["f"]) for s in samples.values())} apertures')
+            fit_kw = dict(k_groups=nexp_groups if has_nexp else 1, k_per_group=nexp_strata)
             # validation fit (holdout_fraction of the apertures kept back), then the production fit on
             # every aperture; the catalog uses the latter, the validation table comes from the former
             validation = None
             if holdout_fraction > 0:
-                validation = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=holdout_fraction)['validation']
-            model = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=0.0)
+                validation = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=holdout_fraction, **fit_kw)['validation']
+            model = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=0.0, **fit_kw)
             if validation is not None:
                 model['validation'] = validation
             model.update({
@@ -430,6 +457,7 @@ def measure_random_apertures(
                 'pixel_scale': pixel_scale,
                 'proxy': proxy_used,
                 'scale': scale_kind,
+                'nexp': has_nexp,
                 'tiles': [tile for tile, _ in results],
                 'n_apertures': [int(len(s['f'])) for s in samples.values()],
                 'wht_check': wht_check,
@@ -437,10 +465,15 @@ def measure_random_apertures(
             })
             with open(pickle_file, 'wb') as f:
                 pickle.dump(model, f)
+            groups = model['groups']
             with open(validation_file, 'w') as f:
                 json.dump({'filter': filt, 'image': imgtype, 'proxy': proxy_used, 'scale': scale_kind,
                            'depth_strata_requested': depth_strata, 'strata_edges_logp': model['strata']['edges'],
                            'strata_log_centres': model['strata']['log_centres'], 'strata_n': model['strata']['n'],
+                           'nexp': has_nexp, 'nexp_groups_requested': nexp_groups if has_nexp else 1,
+                           'group_edges_lognexp': groups['edges'], 'group_log_centres': groups['log_centres'],
+                           'group_n': groups['n'],
+                           'cells': [{'edges_logq': m['edges'], 'log_centres': m['log_centres'], 'n': m['n']} for m in groups['members']],
                            'diameters_arcsec': aperture_diameters.tolist(), 'sqrtN': sqrtN.tolist(),
                            'rms1': float(rms1), 'wht_check': wht_check, 'validation': model['validation']}, f, indent=1)
             if proxy_used == 'empirical' or scale_kind == 'empirical':
@@ -452,7 +485,10 @@ def measure_random_apertures(
                                         value=np.concatenate([v for _, (_, v) in parts]))
             v = model['validation']
             summary = ', '.join(f'{d:.2f}"={w:.2f}' for d, w in zip(aperture_diameters[::max(1, num_radii // 6)], v['overall'][::max(1, num_radii // 6)]) if w is not None)
-            logger.info(f'{filt} ({imgtype}): {len(model["strata"]["log_centres"]) or 1} strata; held-out width measured/predicted: {summary}')
+            cells = ' x '.join(str(len(m['log_centres'])) for m in groups['members'])
+            logger.info(f'{filt} ({imgtype}): {len(model["strata"]["log_centres"]) or 1} strata'
+                        + (f', {len(groups["log_centres"])} exposure-count groups with {cells} strata' if groups['members'] else '')
+                        + f'; held-out width measured/predicted: {summary}')
             logger.info(f'Saving results to {pickle_file}')
             _plot_random_apertures(model, filt, imgtype, plot_file)
 
@@ -466,12 +502,21 @@ def _plot_random_apertures(model: dict, filt: str, imgtype: str, plot_file: Path
     sqrtN = np.asarray(model['sqrtN']); pixel_scale = model['pixel_scale']
     strata = model.get('strata') or {}
     n_strata = len(strata.get('log_centres', []))
+    groups = model.get('groups') or {}
+    n_groups = len(groups.get('log_centres', []))
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.6), constrained_layout=True)
     ax = axes[0]
     x = np.linspace(0, 1.1 * np.max(sqrtN), 400)
     ax.errorbar(sqrtN, model['rmsN/rms1'], yerr=model['rmsN_err/rms1'], fmt='s', mfc='none', mec='k', ms=4, ecolor='k', elinewidth=0.6, label='all apertures')
     ax.plot(x, nc.evaluate_curve(model, x), color='k', lw=1)
-    if n_strata > 1:
+    if n_groups > 1:
+        # one colour per exposure-count group, one line per cell (depth-per-exposure stratum)
+        colors = plt.cm.viridis(np.linspace(0, 1, n_groups))
+        for g in range(n_groups):
+            for s, c in enumerate(groups['members'][g]['curves']):
+                ax.plot(x, nc.evaluate_curve(c, x), color=colors[g], lw=0.7, alpha=0.8,
+                        label=f'NEXP~{np.exp(groups["log_centres"][g]):.0f} ({len(groups["members"][g]["curves"])} strata)' if s == 0 else None)
+    elif n_strata > 1:
         colors = plt.cm.viridis(np.linspace(0, 1, n_strata))
         for s in range(n_strata):
             ax.plot(x, nc.evaluate_curve(strata['curves'][s], x), color=colors[s], lw=0.8,
@@ -483,10 +528,16 @@ def _plot_random_apertures(model: dict, filt: str, imgtype: str, plot_file: Path
     v = model['validation']
     diam = 2 * sqrtN / np.sqrt(np.pi) * pixel_scale
     ax.plot(diam, [np.nan if w is None else w for w in v['overall_single_curve']], 'k--', lw=0.8, label='single curve')
-    ax.plot(diam, [np.nan if w is None else w for w in v['overall']], 'k-', lw=1.2, label='stratified (all)')
-    if n_strata > 1:
-        for s in range(n_strata):
-            ax.plot(diam, [np.nan if w is None else w for w in v['by_stratum'][s]], color=colors[s], lw=0.7)
+    if n_groups > 1:
+        ax.plot(diam, [np.nan if w is None else w for w in v.get('overall_strata', [])], 'k:', lw=0.8, label='depth strata only')
+        ax.plot(diam, [np.nan if w is None else w for w in v['overall']], 'k-', lw=1.2, label='NEXP x depth (all)')
+        for g in range(n_groups):
+            ax.plot(diam, [np.nan if w is None else w for w in v['by_group'][g]], color=colors[g], lw=0.7)
+    else:
+        ax.plot(diam, [np.nan if w is None else w for w in v['overall']], 'k-', lw=1.2, label='stratified (all)')
+        if n_strata > 1:
+            for s in range(n_strata):
+                ax.plot(diam, [np.nan if w is None else w for w in v['by_stratum'][s]], color=colors[s], lw=0.7)
     ax.axhline(1, color='0.5', lw=0.6); ax.set_ylim(0.6, 1.5)
     ax.set_xlabel('aperture diameter [arcsec]'); ax.set_ylabel('held-out: measured / predicted')
     ax.legend(fontsize=6, frameon=False)
@@ -508,8 +559,10 @@ def _get_random_aperture_curve(
 
 
 def _object_noise_inputs(catalog: Table, filt: str, model: dict, empirical_file: Path):
-    """Per-object scale (in image units) and log depth proxy for the model's map choices.
-    Returns (scale, log_proxy); log_proxy is None when the catalog has no column for it."""
+    """Per-object scale (in image units), log depth proxy and log exposure count for the model's
+    map choices. Returns (scale, log_proxy, log_nexp); log_proxy / log_nexp are None when the
+    model does not use them or the catalog has no column for them (the prediction then falls
+    back to the 1-D strata or the pooled curve)."""
     logger = get_logger()
     n = len(catalog)
     emp = None
@@ -550,7 +603,16 @@ def _object_noise_inputs(catalog: Table, filt: str, model: dict, empirical_file:
         else:
             with np.errstate(divide='ignore', invalid='ignore'):
                 log_proxy = np.where(p > 0, np.log(p), np.nan)
-    return scale, log_proxy
+    log_nexp = None
+    if log_proxy is not None and len(model.get('groups', {}).get('log_centres', [])) > 1:
+        if f'nexp_{filt}' in catalog.colnames:
+            e = np.asarray(catalog[f'nexp_{filt}'], float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                log_nexp = np.where(e > 0, np.log(e), np.nan)
+        else:
+            logger.warning(f"{filt}: catalog has no nexp_{filt} column (photometry run without the nexp extension); "
+                           f"using the depth strata without exposure-count groups")
+    return scale, log_proxy, log_nexp
 
 
 def calibrate_flux_uncertainties(
@@ -593,12 +655,12 @@ def calibrate_flux_uncertainties(
         # auto (kron) photometry: PSF-homogenized image unless target/inverse filter
         if f'f_auto_{filt}' in catalog.columns:
             model, empirical_file = model_for(filt, True)
-            scale, log_proxy = _object_noise_inputs(catalog, filt, model, empirical_file)
+            scale, log_proxy, log_nexp = _object_noise_inputs(catalog, filt, model, empirical_file)
             if f'npix_auto_{filt}' in catalog.columns:
                 sqrtN = np.sqrt(np.maximum(np.asarray(catalog[f'npix_auto_{filt}'], float), 1.0))
             else:
                 sqrtN = np.sqrt(np.asarray(catalog['kron1_area'], float))
-            rmsN = to_unit(model['sigma1'] * nc.predict(model, sqrtN, log_proxy) * scale)
+            rmsN = to_unit(model['sigma1'] * nc.predict(model, sqrtN, log_proxy, log_nexp) * scale)
             if f'e_auto_{filt}_uncal' not in catalog.columns:
                 catalog.rename_column(f'e_auto_{filt}', f'e_auto_{filt}_uncal')
             catalog[f'e_auto_{filt}'] = np.where(np.isfinite(catalog[f'e_auto_{filt}_uncal']), rmsN, np.nan)
@@ -606,13 +668,14 @@ def calibrate_flux_uncertainties(
                 catalog[f'e_auto_{filt}'] *= catalog[f'psf_corr_auto_{filt}']
             if 'kron_corr' in catalog.columns:
                 catalog[f'e_auto_{filt}'] *= catalog['kron_corr']
-            models_used.add((model.get('scale'), model.get('proxy'), len(model['strata'].get('log_centres', [])) or 1))
+            models_used.add((model.get('scale'), model.get('proxy'), len(model['strata'].get('log_centres', [])) or 1,
+                             len(model.get('groups', {}).get('log_centres', [])) if log_nexp is not None else 0))
 
         for phot_type, homogenized in (('aper_nat', False), ('aper_hom', True)):
             if f'f_{phot_type}_{filt}' not in catalog.columns:
                 continue
             model, empirical_file = model_for(filt, homogenized)
-            scale, log_proxy = _object_noise_inputs(catalog, filt, model, empirical_file)
+            scale, log_proxy, log_nexp = _object_noise_inputs(catalog, filt, model, empirical_file)
             pixel_scale = model['pixel_scale']
             n_diam = len(aperture_diameters)
             if f'npix_{phot_type}_{filt}' in catalog.columns:
@@ -621,7 +684,7 @@ def calibrate_flux_uncertainties(
                 npix = np.broadcast_to(np.pi * (np.asarray(aperture_diameters) / pixel_scale / 2) ** 2, (len(catalog), n_diam))
             rmsN = np.empty((len(catalog), n_diam))
             for j in range(n_diam):
-                rmsN[:, j] = model['sigma1'] * nc.predict(model, np.sqrt(npix[:, j]), log_proxy) * scale
+                rmsN[:, j] = model['sigma1'] * nc.predict(model, np.sqrt(npix[:, j]), log_proxy, log_nexp) * scale
             rmsN = to_unit(rmsN)
             if f'e_{phot_type}_{filt}_uncal' not in catalog.columns:
                 catalog.rename_column(f'e_{phot_type}_{filt}', f'e_{phot_type}_{filt}_uncal')
@@ -633,7 +696,8 @@ def calibrate_flux_uncertainties(
                     catalog[f'e_aper_hom_{filt}'] *= catalog['aper_corr']
 
     if models_used:
-        catalog.meta['NOISEMOD'] = '; '.join(f'scale={s} proxy={p} strata={k}' for s, p, k in sorted(models_used, key=str))
+        catalog.meta['NOISEMOD'] = '; '.join(f'scale={s} proxy={p} strata={k}' + (f' nexp_groups={g}' if g else '')
+                                             for s, p, k, g in sorted(models_used, key=str))
     _record_applied(catalog, STEP_STATE_KEYS['uncertainty_calibration'], filters)
     return catalog
 
@@ -1263,6 +1327,8 @@ def postprocess_cmd(
                     mask_dilate=postprocess_config.random_apertures.mask_dilate,
                     holdout_fraction=postprocess_config.random_apertures.holdout_fraction,
                     check_weight_map=postprocess_config.random_apertures.check_weight_map,
+                    nexp_groups=postprocess_config.random_apertures.nexp_groups,
+                    nexp_strata=postprocess_config.random_apertures.nexp_strata,
                     parallel=parallel or postprocess_config.random_apertures.parallel,
                     project_dir=project_dir,
                     project_name=config.name,

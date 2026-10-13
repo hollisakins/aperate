@@ -58,6 +58,10 @@ class ImageFiles:
         """Get path to weight image."""
         return self.get_full_path('wht')
     
+    def get_nexp_path(self) -> Optional[Path]:
+        """Path to the exposure-count map (number of exposures per pixel), if any."""
+        return self.get_full_path('nexp')
+
     def get_rms_path(self) -> Optional[Path]:
         """Get path to RMS image."""
         return self.get_full_path('rms')

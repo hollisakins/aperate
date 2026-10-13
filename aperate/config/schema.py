@@ -340,9 +340,15 @@ class RandomAperturesConfig(_Section):
     holdout_fraction: float = 0.2      # apertures kept back for the validation fit only; the production fit uses all
     check_weight_map: bool = True      # compare the weight map with the empirical noise before trusting it
     parallel: int = 1                  # tiles sampled in parallel (processes)
+    # with an 'nexp' image extension (number of exposures per pixel): up to nexp_groups groups of
+    # exposure count, each with nexp_strata strata of depth per exposure; nexp_groups = 1 ignores the map
+    nexp_groups: int = 5
+    nexp_strata: int = 4
 
     @model_validator(mode='after')
     def _ranges(self):
+        if self.nexp_groups < 1 or self.nexp_strata < 1:
+            raise ValueError('nexp_groups and nexp_strata must be >= 1')
         if not 0 < self.min_radius < self.max_radius:
             raise ValueError(f'need 0 < min_radius < max_radius, got {self.min_radius}, {self.max_radius}')
         if self.num_radii < 2:

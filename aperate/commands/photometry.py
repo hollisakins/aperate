@@ -296,12 +296,14 @@ def save_tile_catalog(project_dir: Path, project_name: str, tile: str, catalog: 
         raise
 
 
-def _local_median(image: np.ndarray, x_pos, y_pos, r: float = 5.0, chunk: int = 200000) -> np.ndarray:
-    """Median of the finite pixels whose centres lie within r pixels of each position.
+def _local_median(image: np.ndarray, x_pos, y_pos, r: float = 5.0, chunk: int = 200000, stat: str = 'median') -> np.ndarray:
+    """Median (or mean, stat='mean') of the finite pixels whose centres lie within r pixels of
+    each position.
 
     Vectorised gather over the (2r+1)^2 offsets, in chunks of sources; equivalent to the
     per-source cutout median of photutils.ApertureStats but ~100x faster (F10).
     """
+    reduce = np.nanmedian if stat == 'median' else np.nanmean
     ri = int(np.ceil(r))
     dy, dx = np.mgrid[-ri:ri + 1, -ri:ri + 1]
     inside = (dx ** 2 + dy ** 2) <= r ** 2
@@ -318,8 +320,17 @@ def _local_median(image: np.ndarray, x_pos, y_pos, r: float = 5.0, chunk: int = 
         vals[ok] = image[yy[ok], xx[ok]]
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
-            out[s:s + chunk] = np.nanmedian(vals, axis=1)
+            out[s:s + chunk] = reduce(vals, axis=1)
     return out
+
+
+def _first_data_hdu(path) -> int:
+    """Index of the first HDU with image data (0 for a plain image, 1 for a compressed one)."""
+    with fits.open(path) as hdul:
+        for i, hdu in enumerate(hdul):
+            if hdu.data is not None and np.ndim(hdu.data) >= 2:
+                return i
+    raise ValueError(f'{path}: no image HDU')
 
 
 def compute_weights(ctx: PhotometryContext, filter_name: str, image_files) -> Table:
@@ -348,6 +359,13 @@ def compute_weights(ctx: PhotometryContext, filter_name: str, image_files) -> Ta
         ctx.catalog[f'rms_{filter_name}'] = _local_median(rms, x_pos, y_pos)
     else:
         logger.warning(f"        Could not find rms map for {filter_name}")
+
+    if image_files.has_extension('nexp'):
+        # number of exposures: the local mean (fractional near exposure edges), the same
+        # definition as the random apertures use (noise_curves.PROXY_RADIUS)
+        nexp_path = image_files.get_nexp_path()
+        nexp = ctx.load_image(nexp_path, hdu_index=_first_data_hdu(nexp_path))
+        ctx.catalog[f'nexp_{filter_name}'] = _local_median(nexp.astype(np.float32), x_pos, y_pos, stat='mean').astype(np.float32)
 
     return ctx.catalog
 

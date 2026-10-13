@@ -13,6 +13,17 @@ log p. With K = 1 this is exactly the single-curve ("legacy") model; with K ~ 8 
 it captures the change of the correlated-noise fraction with depth that a single curve cannot
 (review finding F06; see noise_model_design.md).
 
+When a map of the number of exposures NEXP(x) is available the strata are two-dimensional: at
+most `k_groups` groups of exposure count, and within each group strata of the depth per exposure
+q = p / NEXP. The curve shape depends on both (a region that is deep because of a few long
+exposures has more correlated noise than one that is deep because of many dithers), and a
+field-wide fit on p alone mixes the two. Every cell's curve is the one pooled curve times a
+two-parameter tilt; predictions are interpolated linearly in log q within a group and in
+log NEXP between the group centres, so there is no jump at exposure edges. The 1-D strata in
+p are always fitted as well and serve as the fallback for objects without an NEXP value.
+The depth proxies are measured as local means within PROXY_RADIUS pixels, the radius of the
+per-object wht_/rms_/nexp_ catalog columns, so that training and application use one definition.
+
 This module holds the pure numerical parts (sampling one tile, fitting, predicting, validating)
 so that they can be unit-tested; the orchestration over tiles and filters and the file formats
 live in aperate.commands.postprocess.
@@ -28,6 +39,7 @@ from scipy.interpolate import BSpline, make_splrep
 from scipy.optimize import curve_fit
 
 TAIL_PERCENTILES = (96.0, 98.0, 99.0, 99.5)
+PROXY_RADIUS = 5.0       # pixels; the catalog's wht_/rms_/nexp_ columns use the same radius
 
 
 # ---------------------------------------------------------------------------------------------
@@ -149,14 +161,64 @@ def strata_edges(logp: np.ndarray, k: int, min_count: int = 300, tail_percentile
     edges = list(np.percentile(logp, np.linspace(0, 100, k + 1)[1:-1]))
     if tail_percentiles:
         edges += [e for e in np.percentile(logp, tail_percentiles) if e > edges[-1]]
+    # a quantile edge that lands in a mass point (more than 5% of the sample within +-0.02 in
+    # log: a discrete proxy such as a weight map with a few exposure times, blurred only by the
+    # local mean at exposure edges) is moved to just above that cluster, or just below it when
+    # nothing lies above, so that the cluster stays in one bin and no bin is left empty; in a
+    # continuous distribution this shifts an edge by at most 0.02
+    srt = np.sort(logp); n = len(srt); tol = 0.02
+    moved = []
+    for e in edges:
+        lo_i = np.searchsorted(srt, e - tol, side='left'); hi_i = np.searchsorted(srt, e + tol, side='right')
+        if hi_i - lo_i > 0.05 * n:
+            if hi_i < n:
+                e = 0.5 * (srt[hi_i - 1] + srt[hi_i])
+            elif lo_i > 0:
+                e = 0.5 * (srt[lo_i - 1] + srt[lo_i])
+            else:
+                continue
+        moved.append(e)
     # distinct edges strictly inside the range (an edge at the maximum would make an empty bin)
-    edges = sorted({float(e) for e in edges if logp.min() < e < logp.max()})
+    edges = sorted({float(e) for e in moved if logp.min() < e < logp.max()})
     while edges:
         counts = np.bincount(np.digitize(logp, edges), minlength=len(edges) + 1)
         if counts.min() >= min_count:
             break
         i = int(np.argmin(counts))
         edges.pop(min(i, len(edges) - 1) if i > 0 else 0)
+    return np.array(edges)
+
+
+def group_edges(lognexp: np.ndarray, k: int, min_count: int = 300) -> np.ndarray:
+    """Bin edges in log(NEXP) for at most k groups of exposure count with at least min_count
+    members each.
+
+    NEXP is nearly discrete (the local mean of an integer map, fractional only near exposure
+    edges), so the candidate edges are the midpoints, in log, between the integer levels present
+    in the data. The smallest bin is then merged into its smaller neighbour until no more than k
+    bins remain and each holds min_count members: on a field with a wide range of exposure
+    counts this gives quantile-like groups, on a uniform field no groups at all (the model then
+    reduces to the 1-D strata).
+    """
+    x = np.asarray(lognexp, float)
+    x = x[np.isfinite(x)]
+    if k <= 1 or len(x) < 2 * min_count:
+        return np.array([])
+    levels = np.unique(np.maximum(np.rint(np.exp(x)), 1.0))
+    if len(levels) < 2:
+        return np.array([])
+    edges = list(np.log(0.5 * (levels[1:] + levels[:-1])))
+    while edges:
+        counts = np.bincount(np.digitize(x, edges), minlength=len(edges) + 1)
+        if len(edges) + 1 <= k and counts.min() >= min_count:
+            break
+        i = int(np.argmin(counts))
+        if i == 0:
+            edges.pop(0)
+        elif i == len(edges):
+            edges.pop()
+        else:
+            edges.pop(i - 1 if counts[i - 1] <= counts[i + 1] else i)
     return np.array(edges)
 
 
@@ -210,93 +272,170 @@ def negative_tail_width(x: np.ndarray, maxiters: int = 4) -> float:
 
 def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
               holdout_fraction: float = 0.2, min_count: int = 200, width_method: str = 'negative_tail',
-              rng: Optional[np.random.Generator] = None) -> dict:
+              rng: Optional[np.random.Generator] = None, k_groups: int = 1, k_per_group: int = 4) -> dict:
     """Fit the stratified curves.
 
     samples[i] = {'f': normalised aperture sums (sum / S) for diameter index i, 'logp': log proxy at
-    the aperture}. rms1 is the single-pixel width of (image / S) (= 1 if S is the true pixel rms).
+    the aperture, optionally 'lognexp': log of the local number of exposures}. rms1 is the
+    single-pixel width of (image / S) (= 1 if S is the true pixel rms). k strata of log p are
+    fitted; when every sample carries 'lognexp' and k_groups > 1, also up to k_groups groups of
+    exposure count with k_per_group strata of log(p / NEXP) each (see the module docstring).
     Returns the model dictionary (JSON/pickle friendly); the held-out apertures (holdout_fraction
-    of each sample) give the validation table: robust width of f / prediction per stratum and
-    diameter, 1 for a calibrated model.
+    of each sample) give the validation table: robust width of f / prediction per stratum, cell
+    and diameter, 1 for a calibrated model.
     """
     rng = rng or np.random.default_rng(0)
     sqrtN = np.asarray(sqrtN, float)
+    nd = len(sqrtN)
+    use_groups = k_groups > 1 and all('lognexp' in s for s in samples.values())
     train, test = {}, {}
     for i, s in samples.items():
         f = np.asarray(s['f'], float); logp = np.asarray(s['logp'], float)
-        ok = np.isfinite(f) & np.isfinite(logp)
-        f, logp = f[ok], logp[ok]
+        lognexp = np.asarray(s['lognexp'], float) if use_groups else np.zeros(len(f))
+        ok = np.isfinite(f) & np.isfinite(logp) & np.isfinite(lognexp)
+        f, logp, lognexp = f[ok], logp[ok], lognexp[ok]
         is_test = rng.random(len(f)) < holdout_fraction
-        train[i] = (f[~is_test], logp[~is_test]); test[i] = (f[is_test], logp[is_test])
+        train[i] = (f[~is_test], logp[~is_test], lognexp[~is_test])
+        test[i] = (f[is_test], logp[is_test], lognexp[is_test])
 
-    # pooled (single-curve) fit: the legacy model, always stored
-    pooled = np.array([robust_width(train[i][0], width_method) / rms1 for i in range(len(sqrtN))])
-    pooled_err = np.array([pooled[i] / np.sqrt(2 * max(len(train[i][0]), 1)) for i in range(len(sqrtN))])
+    # pooled (single-curve) fit: the legacy model, always stored, and the base of every tilt
+    pooled = np.array([robust_width(train[i][0], width_method) / rms1 for i in range(nd)])
+    pooled_err = np.array([pooled[i] / np.sqrt(2 * max(len(train[i][0]), 1)) for i in range(nd)])
     model = {'sqrtN': sqrtN, 'rmsN/rms1': pooled, 'rmsN_err/rms1': pooled_err, 'k': int(k)}
     model.update(fit_curve(sqrtN, pooled, pooled_err))
 
-    # strata on the diameter with the fewest training apertures (so every stratum is populated at
-    # every diameter)
-    i_min = min(train, key=lambda i: len(train[i][0]))
-    edges = strata_edges(train[i_min][1], k, min_count=min_count)
-    strata = {'edges': edges.tolist(), 'log_centres': [], 'curves': [], 'rmsN/rms1': [], 'n': []}
-    n_strata = len(edges) + 1
-    if n_strata > 1:
-        all_logp = np.concatenate([train[i][1] for i in train])
-        all_bin = np.digitize(all_logp, edges)
-        for s in range(n_strata):
-            strata['log_centres'].append(float(np.median(all_logp[all_bin == s])))
+    def fit_strata(masks, logq, k_s, allow_single):
+        """Strata of logq[i] among the apertures selected by masks[i]: edges on the diameter with the
+        fewest selected apertures (so every stratum is populated at every diameter), then the width
+        per stratum and diameter and its tilt on the pooled curve. Without edges the result is empty
+        (the pooled curve applies) unless allow_single, in which case the one stratum is the tilt of
+        the whole selection."""
+        i_min = min(train, key=lambda i: int(masks[i].sum()))
+        edges = strata_edges(logq[i_min][masks[i_min]], k_s, min_count=min_count)
+        strata = {'edges': edges.tolist(), 'log_centres': [], 'curves': [], 'rmsN/rms1': [], 'n': []}
+        if len(edges) == 0 and not allow_single:
+            return strata
+        all_q = np.concatenate([logq[i][masks[i]] for i in train])
+        all_bin = np.digitize(all_q, edges)
+        for s in range(len(edges) + 1):
+            strata['log_centres'].append(float(np.median(all_q[all_bin == s])) if np.any(all_bin == s) else float('nan'))
             widths, errs, ns = [], [], []
-            for i in range(len(sqrtN)):
-                f, logp = train[i]
-                sel = np.digitize(logp, edges) == s
-                w = robust_width(f[sel], width_method) / rms1
+            for i in range(nd):
+                sel = masks[i] & (np.digitize(logq[i], edges) == s)
+                w = robust_width(train[i][0][sel], width_method) / rms1
                 widths.append(w); errs.append(w / np.sqrt(2 * max(sel.sum(), 1))); ns.append(int(sel.sum()))
             strata['rmsN/rms1'].append(widths); strata['n'].append(ns)
             strata['curves'].append(fit_tilt(model, sqrtN, np.array(widths), np.array(errs)))
-    model['strata'] = strata
+        return strata
+
+    # 1-D strata in log p (the model when there is no exposure-count map, and the fallback)
+    everything = {i: np.ones(len(train[i][0]), bool) for i in train}
+    model['strata'] = fit_strata(everything, {i: train[i][1] for i in train}, k, allow_single=False)
+    n_strata = len(model['strata']['log_centres'])
+
+    # 2-D: groups of exposure count x strata of depth per exposure
+    groups = {'edges': [], 'log_centres': [], 'n': [], 'members': [], 'k_per_group': int(k_per_group)}
+    if use_groups:
+        i_min = min(train, key=lambda i: len(train[i][0]))
+        gedges = group_edges(train[i_min][2], k_groups, min_count=min_count)
+        if len(gedges) >= 1:
+            logq = {i: train[i][1] - train[i][2] for i in train}
+            all_n = np.concatenate([train[i][2] for i in train]); all_g = np.digitize(all_n, gedges)
+            groups['edges'] = gedges.tolist()
+            for g in range(len(gedges) + 1):
+                masks = {i: np.digitize(train[i][2], gedges) == g for i in train}
+                groups['log_centres'].append(float(np.median(all_n[all_g == g])))
+                groups['n'].append([int(masks[i].sum()) for i in range(nd)])
+                groups['members'].append(fit_strata(masks, logq, k_per_group, allow_single=True))
+    model['groups'] = groups
+    n_groups = len(groups['log_centres'])
 
     # validation on the held-out apertures
-    val = {'overall': [], 'by_stratum': [[None] * len(sqrtN) for _ in range(n_strata)],
-           'overall_single_curve': [], 'n_test': []}
-    for i in range(len(sqrtN)):
-        f, logp = test[i]
+    val = {'overall': [], 'overall_single_curve': [], 'overall_strata': [], 'n_test': [],
+           'by_stratum': [[None] * nd for _ in range(n_strata)],
+           'by_group': [[None] * nd for _ in range(n_groups)],
+           'by_cell': [[[None] * nd for _ in range(len(m['log_centres']))] for m in groups['members']]}
+    for i in range(nd):
+        f, logp, lognexp = test[i]
+        val['n_test'].append(int(len(f)))
         if len(f) < 50:
-            val['overall'].append(None); val['overall_single_curve'].append(None); val['n_test'].append(int(len(f)))
+            val['overall'].append(None); val['overall_single_curve'].append(None); val['overall_strata'].append(None)
             continue
-        pred = rms1 * predict(model, np.full(len(f), sqrtN[i]), logp)
-        pred1 = rms1 * evaluate_curve(model, np.full(len(f), sqrtN[i]))
+        sq = np.full(len(f), sqrtN[i])
+        pred = rms1 * predict(model, sq, logp, lognexp if n_groups > 1 else None)
+        pred1 = rms1 * evaluate_curve(model, sq)
+        pred_s = rms1 * predict(model, sq, logp)
         # same width estimator as the fit, so that undetected sources bias both the same way
         val['overall'].append(robust_width(f / pred, width_method))
         val['overall_single_curve'].append(robust_width(f / pred1, width_method))
-        val['n_test'].append(int(len(f)))
+        val['overall_strata'].append(robust_width(f / pred_s, width_method))
         if n_strata > 1:
-            b = np.digitize(logp, edges)
+            b = np.digitize(logp, model['strata']['edges'])
             for s in range(n_strata):
                 sel = b == s
                 if sel.sum() >= 50:
-                    val['by_stratum'][s][i] = robust_width(f[sel] / pred[sel], width_method)
+                    val['by_stratum'][s][i] = robust_width(f[sel] / pred_s[sel], width_method)
+        if n_groups > 1:
+            gb = np.digitize(lognexp, groups['edges'])
+            for g in range(n_groups):
+                sel_g = gb == g
+                if sel_g.sum() >= 50:
+                    val['by_group'][g][i] = robust_width(f[sel_g] / pred[sel_g], width_method)
+                member = groups['members'][g]
+                sb = np.digitize(logp - lognexp, member['edges'])
+                for s in range(len(member['log_centres'])):
+                    sel = sel_g & (sb == s)
+                    if sel.sum() >= 50:
+                        val['by_cell'][g][s][i] = robust_width(f[sel] / pred[sel], width_method)
     model['validation'] = val
     return model
 
 
-def predict(model: dict, sqrtN, logp=None) -> np.ndarray:
-    """sigma_N/sigma_1 for apertures of sqrt(N) = sqrtN at depth proxy log p (arrays of the same
-    length, or scalar logp). Without strata, or without logp, the pooled curve is used."""
-    sqrtN = np.atleast_1d(np.asarray(sqrtN, float))
-    strata = model.get('strata') or {}
-    centres = np.asarray(strata.get('log_centres', []), float)
-    if logp is None or len(centres) < 2:
-        return evaluate_curve(model, sqrtN)
-    logp = np.broadcast_to(np.asarray(logp, float), sqrtN.shape)
-    values = np.stack([evaluate_curve(c, sqrtN) for c in strata['curves']])     # (S, n)
-    pos = np.interp(logp, centres, np.arange(len(centres)))                   # fractional stratum index
+def _interp_rows(values: np.ndarray, centres: np.ndarray, coord: np.ndarray) -> np.ndarray:
+    """Linear interpolation between the rows of values (one per centre, columns = apertures) at
+    coord, clamped to the outer rows; non-finite coordinates take the first row."""
+    pos = np.interp(coord, centres, np.arange(len(centres)))
     pos = np.where(np.isfinite(pos), pos, 0.0)
     lo = np.clip(np.floor(pos).astype(int), 0, len(centres) - 1)
     hi = np.clip(lo + 1, 0, len(centres) - 1)
     w = pos - lo
-    idx = np.arange(len(sqrtN))
+    idx = np.arange(values.shape[1])
     return (1 - w) * values[lo, idx] + w * values[hi, idx]
+
+
+def _predict_strata(strata: dict, model: dict, sqrtN: np.ndarray, logq: np.ndarray) -> np.ndarray:
+    centres = np.asarray(strata.get('log_centres', []), float)
+    if len(centres) == 0:
+        return evaluate_curve(model, sqrtN)
+    if len(centres) == 1:
+        return evaluate_curve(strata['curves'][0], sqrtN)
+    values = np.stack([evaluate_curve(c, sqrtN) for c in strata['curves']])     # (S, n)
+    return _interp_rows(values, centres, logq)
+
+
+def predict(model: dict, sqrtN, logp=None, lognexp=None) -> np.ndarray:
+    """sigma_N/sigma_1 for apertures of sqrt(N) = sqrtN at depth proxy log p and, when the model
+    has exposure-count groups, log NEXP (arrays of the same length, or scalars). Without logp the
+    pooled curve is used; without lognexp (or for apertures where it is not finite) the 1-D
+    strata in log p."""
+    sqrtN = np.atleast_1d(np.asarray(sqrtN, float))
+    if logp is None:
+        return evaluate_curve(model, sqrtN)
+    logp = np.broadcast_to(np.asarray(logp, float), sqrtN.shape)
+    out = _predict_strata(model.get('strata') or {}, model, sqrtN, logp)
+    groups = model.get('groups') or {}
+    gcentres = np.asarray(groups.get('log_centres', []), float)
+    if lognexp is None or len(gcentres) < 2:
+        return out
+    lognexp = np.broadcast_to(np.asarray(lognexp, float), sqrtN.shape)
+    use = np.isfinite(lognexp) & np.isfinite(logp)
+    if not use.any():
+        return out
+    logq = logp[use] - lognexp[use]
+    values = np.stack([_predict_strata(m, model, sqrtN[use], logq) for m in groups['members']])   # (G, n)
+    out = np.array(out, float)
+    out[use] = _interp_rows(values, gcentres, lognexp[use])
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -330,7 +469,11 @@ def sample_image(sci: np.ndarray, scale: np.ndarray, proxies: Dict[str, np.ndarr
     balance_bins > 0: the apertures are drawn so that `balance_bins` equal-width bins of the log
     of the first proxy map get (as far as the image allows) the same number of apertures, i.e.
     rare depths (the deep tail, where the correlated noise differs most) are oversampled instead
-    of being represented by a few per cent of area-weighted apertures.
+    of being represented by a few per cent of area-weighted apertures. A proxy named 'nexp' (the
+    exposure-count map) is not balanced on by itself but splits every depth bin by its integer
+    level, so that rare (exposure count, depth) cells are sampled too. All proxies are read as
+    local means within PROXY_RADIUS pixels of the aperture centre, the definition of the
+    per-object catalog columns.
     """
     rng = rng or np.random.default_rng()
     ny, nx = sci.shape
@@ -349,7 +492,7 @@ def sample_image(sci: np.ndarray, scale: np.ndarray, proxies: Dict[str, np.ndarr
     pixels = nsci[iy[ok], ix[ok]][:n_pixel_sample]
 
     out = {'f': [], 'logp': {name: [] for name in proxies0}, 'x': [], 'y': [], 'pixels': pixels, 'n_valid': n_valid}
-    first_proxy = next(iter(proxies0)) if proxies0 else None
+    first_proxy = next((name for name in proxies0 if name != 'nexp'), None)
     for r, nap in zip(radii_pix, n_apertures):
         xs, ys = [], []
         want = nap * (4 if balance_bins and first_proxy else 1)    # candidates for the depth balancing
@@ -365,17 +508,22 @@ def sample_image(sci: np.ndarray, scale: np.ndarray, proxies: Dict[str, np.ndarr
                 break
         x = np.concatenate(xs)[:want]; y = np.concatenate(ys)[:want]
         if balance_bins and first_proxy and len(x) > nap:
-            p = local_mean(proxies0[first_proxy], x, y, max(r, 5.0))
+            p = local_mean(proxies0[first_proxy], x, y, PROXY_RADIUS)
             with np.errstate(divide='ignore', invalid='ignore'):
                 lp = np.where(p > 0, np.log(p), np.nan)
             lp = np.where(np.isfinite(lp), lp, np.nanmedian(lp))
             lo, hi = np.percentile(lp, [0.5, 99.5])
             b = np.clip(((lp - lo) / max(hi - lo, 1e-9) * balance_bins).astype(int), 0, balance_bins - 1)
-            target = int(np.ceil(nap / balance_bins))
+            if 'nexp' in proxies0:
+                level = np.maximum(np.rint(local_mean(proxies0['nexp'], x, y, PROXY_RADIUS)), 1)
+                b = b + balance_bins * np.unique(level, return_inverse=True)[1].ravel()
+            n_bins = int(b.max()) + 1
+            target = int(np.ceil(nap / n_bins))
             chosen = []
-            for k in range(balance_bins):
+            for k in range(n_bins):
                 members = np.flatnonzero(b == k)
-                chosen.append(rng.choice(members, min(len(members), target), replace=False))
+                if len(members):
+                    chosen.append(rng.choice(members, min(len(members), target), replace=False))
             chosen = np.concatenate(chosen)
             if len(chosen) < nap:        # fill up from the remaining candidates
                 rest = np.setdiff1d(np.arange(len(x)), chosen)
@@ -384,7 +532,7 @@ def sample_image(sci: np.ndarray, scale: np.ndarray, proxies: Dict[str, np.ndarr
         f, _, _ = sep.sum_circle(nsci, x, y, r, subpix=5)
         out['f'].append(f); out['x'].append(x); out['y'].append(y)
         for name, p0 in proxies0.items():
-            p = local_mean(p0, x, y, max(r, 5.0))
+            p = local_mean(p0, x, y, PROXY_RADIUS)
             with np.errstate(divide='ignore', invalid='ignore'):
                 out['logp'][name].append(np.where(p > 0, np.log(p), np.nan))
     return out
