@@ -119,6 +119,12 @@ def test_group_edges_merge_small_groups_and_respect_k():
     assert len(nc.group_edges(lognexp, 2, min_count=300)) == 1
     assert nc.group_edges(np.zeros(10000), 5).size == 0        # one level: no groups
     assert nc.group_edges(lognexp, 1).size == 0
+    # a cosmos-like population (levels 1-20, the single-exposure level 2% of the apertures but
+    # above min_count): with k = 5 the single-exposure level keeps its own group and the rare
+    # high counts merge among themselves: 1 | 2 | 3-4 | 5-8 | 9+
+    counts = np.array([960, 4000, 300, 3500, 200, 300, 150, 250, 200, 150, 100, 120, 80, 80, 60, 60, 40, 40, 30, 30]) * 10
+    x = np.concatenate([np.full(c, np.log(l)) for l, c in zip(range(1, 21), counts)]) + rng.normal(0, 0.01, counts.sum())
+    assert np.allclose(np.exp(nc.group_edges(x, 5, min_count=2000)), [1.5, 2.5, 4.5, 8.5])
 
 
 def test_fit_model_without_nexp_has_no_groups(field):

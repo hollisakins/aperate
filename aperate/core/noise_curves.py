@@ -18,7 +18,7 @@ most `k_groups` groups of exposure count, and within each group strata of the de
 q = p / NEXP. The curve shape depends on both (a region that is deep because of a few long
 exposures has more correlated noise than one that is deep because of many dithers), and a
 field-wide fit on p alone mixes the two. Every cell's curve is the one pooled curve times a
-two-parameter tilt; predictions are interpolated linearly in log q within a group and in
+quadratic tilt in log sqrt N; predictions are interpolated linearly in log q within a group and in
 log NEXP between the group centres, so there is no jump at exposure edges. The 1-D strata in
 p are always fitted as well and serve as the fallback for objects without an NEXP value.
 The depth proxies are measured as local means within PROXY_RADIUS pixels, the radius of the
@@ -99,11 +99,13 @@ def evaluate_curve(curve: dict, sqrtN) -> np.ndarray:
     """sigma_N/sigma_1 at sqrtN for one fitted curve."""
     sqrtN = np.asarray(sqrtN, float)
     if 'tilt' in curve:
-        # stratum curve = base (pooled) curve x exp(a + b log sqrtN): see fit_model
-        a, b = curve['tilt']
+        # stratum curve = base (pooled) curve x exp(polynomial in log sqrtN), the polynomial held
+        # constant beyond the range of the data it was fitted to: see fit_tilt
         with np.errstate(divide='ignore'):
             L = np.log(np.maximum(sqrtN, 1e-9))
-        return evaluate_curve(curve['base'], sqrtN) * np.exp(a + b * L)
+        if 'tilt_range' in curve:
+            L = np.clip(L, curve['tilt_range'][0], curve['tilt_range'][1])
+        return evaluate_curve(curve['base'], sqrtN) * np.exp(np.polyval(curve['tilt'][::-1], L))
     if 'loglog' in curve:
         c = curve['loglog']['coef']; Lmax = curve['loglog']['Lmax']
         with np.errstate(divide='ignore'):
@@ -119,12 +121,15 @@ def evaluate_curve(curve: dict, sqrtN) -> np.ndarray:
 
 
 def fit_tilt(base: dict, sqrtN: np.ndarray, ratio: np.ndarray, ratio_err: Optional[np.ndarray] = None) -> dict:
-    """A stratum's curve as the base (pooled) curve times exp(a + b log sqrtN).
+    """A stratum's curve as the base (pooled) curve times exp(a + b L + c L^2), L = log sqrtN.
 
     The difference between depth strata is a slowly varying factor (e.g. 1.15-1.25 in the deep
-    tail of B1), so two parameters per stratum are enough and are far less noisy than an
-    independent curve when a stratum holds only ~1000 apertures. Weighted least squares with
-    one pass of outlier rejection; the tilt is pinned to zero where the stratum has no data.
+    tail of B1), but not always a straight line in L: the single-exposure strips of cosmos_v1.3
+    sit 20% above the pooled curve up to 0.8" and below it beyond 1.4" (a knee a two-parameter
+    tilt misses by up to 40%), so the tilt is quadratic when the stratum has widths at six or
+    more diameters, linear otherwise. Weighted least squares with one pass of outlier rejection;
+    the polynomial is held constant outside the range of diameters that were fitted
+    ('tilt_range'), and a stratum with fewer than three widths gets the base curve.
     """
     sqrtN = np.asarray(sqrtN, float); ratio = np.asarray(ratio, float)
     base_vals = evaluate_curve(base, sqrtN)
@@ -132,21 +137,22 @@ def fit_tilt(base: dict, sqrtN: np.ndarray, ratio: np.ndarray, ratio_err: Option
     if ratio_err is None:
         ratio_err = 0.03 * ratio
     ratio_err = np.asarray(ratio_err, float)
+    out = {'base': {k: base[k] for k in ('loglog', 'spline', 'plaw', 'sqrtN_max') if k in base}}
+    if ok.sum() < 3:
+        return dict(out, tilt=[0.0, 0.0])
     L = np.log(sqrtN[ok]); y = np.log(ratio[ok] / base_vals[ok])
     w = np.where(np.isfinite(ratio_err[ok]) & (ratio_err[ok] > 0), ratio[ok] / ratio_err[ok], 1.0 / 0.03)
-    if ok.sum() < 3:
-        return {'base': {k: base[k] for k in ('loglog', 'spline', 'plaw', 'sqrtN_max') if k in base}, 'tilt': [0.0, 0.0]}
+    order = 2 if ok.sum() >= 6 else 1
     keep = np.ones(len(L), bool)
-    coef = np.array([0.0, 0.0])
+    coef = np.zeros(order + 1)
     for _ in range(2):
-        A = np.vstack([np.ones(keep.sum()), L[keep]]).T * w[keep, None]
+        A = np.vstack([L[keep] ** d for d in range(order + 1)]).T * w[keep, None]
         coef = np.linalg.lstsq(A, y[keep] * w[keep], rcond=None)[0]
-        resid = y - (coef[0] + coef[1] * L)
+        resid = y - np.polyval(coef[::-1], L)
         keep = np.abs(resid) < np.maximum(3 / w, 0.15)
-        if keep.sum() < 3:
+        if keep.sum() < order + 2:
             keep = np.ones(len(L), bool); break
-    return {'base': {k: base[k] for k in ('loglog', 'spline', 'plaw', 'sqrtN_max') if k in base},
-            'tilt': [float(coef[0]), float(coef[1])]}
+    return dict(out, tilt=[float(c) for c in coef], tilt_range=[float(L[keep].min()), float(L[keep].max())])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -196,13 +202,13 @@ def group_edges(lognexp: np.ndarray, k: int, min_count: int = 300) -> np.ndarray
 
     NEXP is nearly discrete (the local mean of an integer map, fractional only near exposure
     edges), so the bins start as the integer levels present in the data, split at the midpoints
-    in log. Adjacent bins are then merged agglomeratively with Ward's criterion on log NEXP,
-    cost = n_i n_j / (n_i + n_j) * (mean_i - mean_j)^2: a bin below min_count joins the
-    neighbour with the lower cost, and otherwise the cheapest adjacent pair is merged until no
-    more than k bins remain. Rare high exposure counts, which are close in log, are merged among
-    themselves first, while a single-exposure level stays separate from the two-exposure one (a
-    factor of 2) as long as it holds min_count apertures. A uniform field gives no groups (the
-    model then reduces to the 1-D strata).
+    in log. Adjacent bins are then merged agglomeratively: a bin below min_count joins the
+    neighbour whose mean log NEXP is nearer, and otherwise the two adjacent bins nearest to each
+    other in mean log NEXP are merged until no more than k bins remain. The gap between levels
+    shrinks with NEXP (1:2 is 0.69 in log, 2:3 0.41, 8:9 0.12), so the high counts merge first
+    and the single-exposure level, whose noise differs most, is the last to be merged, however
+    few apertures it holds above min_count (a count-weighted criterion would merge it first).
+    A uniform field gives no groups (the model then reduces to the 1-D strata).
     """
     x = np.asarray(lognexp, float)
     x = x[np.isfinite(x)]
@@ -215,8 +221,8 @@ def group_edges(lognexp: np.ndarray, k: int, min_count: int = 300) -> np.ndarray
     # bins: contiguous runs of levels; keep count, mean log NEXP and the level range of each
     bins = [{'n': int(c), 'mean': float(np.mean(x[level == l])), 'lo': float(l), 'hi': float(l)} for l, c in zip(levels, counts)]
 
-    def cost(a, b):
-        return a['n'] * b['n'] / (a['n'] + b['n']) * (a['mean'] - b['mean']) ** 2
+    def gap(i):
+        return bins[i + 1]['mean'] - bins[i]['mean']
 
     def merge(i):
         a, b = bins[i], bins[i + 1]
@@ -228,9 +234,9 @@ def group_edges(lognexp: np.ndarray, k: int, min_count: int = 300) -> np.ndarray
         if small:
             i = small[0]
             cands = [j for j in (i - 1, i) if 0 <= j < len(bins) - 1]
-            merge(min(cands, key=lambda j: cost(bins[j], bins[j + 1])))
+            merge(min(cands, key=gap))
         elif len(bins) > k:
-            merge(min(range(len(bins) - 1), key=lambda j: cost(bins[j], bins[j + 1])))
+            merge(min(range(len(bins) - 1), key=gap))
         else:
             break
     if len(bins) < 2:
