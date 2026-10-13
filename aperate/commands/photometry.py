@@ -582,10 +582,14 @@ def _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params):
         seg_id=ids
     )
 
+    # semi-axes of the Kron ellipse actually summed above, in pixels
     a = kron_params[0]*kronrad*a
     b = kron_params[0]*kronrad*b
 
-    use_circle = kron_params[0] * kronrad * np.sqrt(a * b) < kron_params[1]
+    # Minimum-circle rule: ellipses whose geometric-mean radius falls below the minimum radius
+    # kron_params[1] (pixels) are replaced by a circle of that radius.  a and b are already
+    # scaled by kron_params[0]*kronrad, so the factor must not be applied again (F20).
+    use_circle = np.sqrt(a * b) < kron_params[1]
 
     cflux, cfluxerr, cflag = sep.sum_circle(
         sci, 
