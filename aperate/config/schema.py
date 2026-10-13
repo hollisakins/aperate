@@ -337,7 +337,7 @@ class RandomAperturesConfig(_Section):
     scale_map: Literal['auto', 'rms', 'wht', 'empirical'] = 'auto'
     mask_sources: bool = True          # apertures avoid the segmentation map
     mask_dilate: int = 3               # pixels added around sources and invalid pixels
-    holdout_fraction: float = 0.2      # apertures kept back to report the calibration
+    holdout_fraction: float = 0.2      # apertures kept back for the validation fit only; the production fit uses all
     check_weight_map: bool = True      # compare the weight map with the empirical noise before trusting it
     parallel: int = 1                  # tiles sampled in parallel (processes)
 

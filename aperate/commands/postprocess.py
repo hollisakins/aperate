@@ -416,7 +416,14 @@ def measure_random_apertures(
             pixel_scale = float(np.median(pixel_scales))
             sqrtN = np.sqrt(np.pi) * aperture_diameters / 2 / pixel_scale
             logger.info(f'{filt}: fitting {depth_strata} depth strata on {sum(len(s["f"]) for s in samples.values())} apertures')
-            model = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=holdout_fraction)
+            # validation fit (holdout_fraction of the apertures kept back), then the production fit on
+            # every aperture; the catalog uses the latter, the validation table comes from the former
+            validation = None
+            if holdout_fraction > 0:
+                validation = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=holdout_fraction)['validation']
+            model = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=0.0)
+            if validation is not None:
+                model['validation'] = validation
             model.update({
                 'sigma1': float(rms1 * np.median(conversions)),
                 'rms1': float(rms1),
