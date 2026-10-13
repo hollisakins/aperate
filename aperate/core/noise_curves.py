@@ -40,6 +40,7 @@ from scipy.optimize import curve_fit
 
 TAIL_PERCENTILES = (96.0, 98.0, 99.0, 99.5)
 PROXY_RADIUS = 5.0       # pixels; the catalog's wht_/rms_/nexp_ columns use the same radius
+MIN_TEST = 150           # held-out apertures needed before a per-stratum/cell width is reported
 
 
 # ---------------------------------------------------------------------------------------------
@@ -373,19 +374,19 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
             b = np.digitize(logp, model['strata']['edges'])
             for s in range(n_strata):
                 sel = b == s
-                if sel.sum() >= 50:
+                if sel.sum() >= MIN_TEST:
                     val['by_stratum'][s][i] = robust_width(f[sel] / pred_s[sel], width_method)
         if n_groups > 1:
             gb = np.digitize(lognexp, groups['edges'])
             for g in range(n_groups):
                 sel_g = gb == g
-                if sel_g.sum() >= 50:
+                if sel_g.sum() >= MIN_TEST:
                     val['by_group'][g][i] = robust_width(f[sel_g] / pred[sel_g], width_method)
                 member = groups['members'][g]
                 sb = np.digitize(logp - lognexp, member['edges'])
                 for s in range(len(member['log_centres'])):
                     sel = sel_g & (sb == s)
-                    if sel.sum() >= 50:
+                    if sel.sum() >= MIN_TEST:
                         val['by_cell'][g][s][i] = robust_width(f[sel] / pred[sel], width_method)
     model['validation'] = val
     return model

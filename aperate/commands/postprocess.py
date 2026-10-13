@@ -445,12 +445,19 @@ def measure_random_apertures(
             fit_kw = dict(k_groups=nexp_groups if has_nexp else 1, k_per_group=nexp_strata)
             # validation fit (holdout_fraction of the apertures kept back), then the production fit on
             # every aperture; the catalog uses the latter, the validation table comes from the former
-            validation = None
+            validation, vstructure = None, None
             if holdout_fraction > 0:
-                validation = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=holdout_fraction, **fit_kw)['validation']
+                vfit = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=holdout_fraction, **fit_kw)
+                validation = vfit['validation']
+                # the validation fit may form a different number of strata/groups than the production
+                # fit on all apertures: the validation table is indexed by its own structure
+                vstructure = {'strata_log_centres': vfit['strata']['log_centres'], 'strata_n': vfit['strata']['n'],
+                              'group_log_centres': vfit['groups']['log_centres'], 'group_n': vfit['groups']['n'],
+                              'cells': [{'log_centres': m['log_centres'], 'n': m['n']} for m in vfit['groups']['members']]}
             model = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=0.0, **fit_kw)
             if validation is not None:
                 model['validation'] = validation
+                model['validation_structure'] = vstructure
             model.update({
                 'sigma1': float(rms1 * np.median(conversions)),
                 'rms1': float(rms1),
@@ -475,7 +482,8 @@ def measure_random_apertures(
                            'group_n': groups['n'],
                            'cells': [{'edges_logq': m['edges'], 'log_centres': m['log_centres'], 'n': m['n']} for m in groups['members']],
                            'diameters_arcsec': aperture_diameters.tolist(), 'sqrtN': sqrtN.tolist(),
-                           'rms1': float(rms1), 'wht_check': wht_check, 'validation': model['validation']}, f, indent=1)
+                           'rms1': float(rms1), 'wht_check': wht_check, 'validation': model['validation'],
+                           'validation_structure': model.get('validation_structure')}, f, indent=1)
             if proxy_used == 'empirical' or scale_kind == 'empirical':
                 parts = [(tile, r['empirical_at_sources']) for tile, r in results if 'empirical_at_sources' in r]
                 if parts:
@@ -531,13 +539,15 @@ def _plot_random_apertures(model: dict, filt: str, imgtype: str, plot_file: Path
     if n_groups > 1:
         ax.plot(diam, [np.nan if w is None else w for w in v.get('overall_strata', [])], 'k:', lw=0.8, label='depth strata only')
         ax.plot(diam, [np.nan if w is None else w for w in v['overall']], 'k-', lw=1.2, label='NEXP x depth (all)')
-        for g in range(n_groups):
-            ax.plot(diam, [np.nan if w is None else w for w in v['by_group'][g]], color=colors[g], lw=0.7)
+        vg = v.get('by_group', [])
+        for g in range(len(vg)):
+            ax.plot(diam, [np.nan if w is None else w for w in vg[g]], color=colors[min(g, n_groups - 1)], lw=0.7)
     else:
         ax.plot(diam, [np.nan if w is None else w for w in v['overall']], 'k-', lw=1.2, label='stratified (all)')
+        vs = v.get('by_stratum', [])
         if n_strata > 1:
-            for s in range(n_strata):
-                ax.plot(diam, [np.nan if w is None else w for w in v['by_stratum'][s]], color=colors[s], lw=0.7)
+            for s in range(len(vs)):
+                ax.plot(diam, [np.nan if w is None else w for w in vs[s]], color=colors[min(s, n_strata - 1)], lw=0.7)
     ax.axhline(1, color='0.5', lw=0.6); ax.set_ylim(0.6, 1.5)
     ax.set_xlabel('aperture diameter [arcsec]'); ax.set_ylabel('held-out: measured / predicted')
     ax.legend(fontsize=6, frameon=False)
