@@ -137,3 +137,34 @@ def test_strata_edges_handle_a_discrete_proxy():
     counts = np.bincount(np.digitize(logp, edges), minlength=len(edges) + 1)
     assert len(edges) == 2 and counts.min() >= 300
     assert np.all((edges > 0.1) & (edges < 1.9))
+
+
+def test_validation_and_production_fits_share_the_structure(field):
+    s, sqrtN, rms1 = field
+    kw = dict(k=4, width_method='biweight', k_groups=2, k_per_group=2)
+    with_holdout = nc.fit_model(s, sqrtN, rms1, holdout_fraction=0.3, **kw)
+    production = nc.fit_model(s, sqrtN, rms1, holdout_fraction=0.0, **kw)
+    assert with_holdout['strata']['edges'] == production['strata']['edges']
+    assert with_holdout['groups']['edges'] == production['groups']['edges']
+    assert [m['edges'] for m in with_holdout['groups']['members']] == [m['edges'] for m in production['groups']['members']]
+    assert production['validation']['n_test'] == [0] * len(sqrtN)
+
+
+def test_a_level_whose_apertures_thin_out_with_diameter_keeps_its_group(field):
+    s, sqrtN, rms1 = field
+    rng = np.random.default_rng(5)
+    # single-exposure strips: plenty of small apertures, few large ones (5% at the two largest sizes)
+    thinned = {}
+    for i in s:
+        level = np.rint(np.exp(s[i]['lognexp']))
+        keep = (level != 1) | (rng.random(len(level)) < (0.05 if i >= 2 else 1.0))
+        thinned[i] = {k: v[keep] for k, v in s[i].items()}
+    assert (np.rint(np.exp(thinned[3]['lognexp'])) == 1).sum() < 500
+    model = nc.fit_model(thinned, sqrtN, rms1, k=4, holdout_fraction=0.2, width_method='biweight',
+                         k_groups=2, k_per_group=2, min_count_cell=500)
+    assert len(model['groups']['log_centres']) == 2
+    assert np.isclose(np.exp(model['groups']['log_centres'][0]), 1.0, atol=0.1)
+    # the single-exposure group is still calibrated where it has held-out apertures
+    for c in range(len(model['groups']['members'][0]['log_centres'])):
+        w = model['validation']['by_cell'][0][c][0]
+        assert w is not None and abs(w - 1) < 0.10, (c, w)

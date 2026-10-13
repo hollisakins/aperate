@@ -297,8 +297,8 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
     single-pixel width of (image / S) (= 1 if S is the true pixel rms). k strata of log p are
     fitted; when every sample carries 'lognexp' and k_groups > 1, also up to k_groups groups of
     exposure count with k_per_group strata of log(p / NEXP) each (see the module docstring); the
-    groups and their strata need min_count_cell apertures per diameter (no tail bins there:
-    a deep patch is a group of its own).
+    groups and their strata need min_count_cell apertures per diameter on average (no tail bins
+    there: a deep patch is a group of its own).
     Returns the model dictionary (JSON/pickle friendly); the held-out apertures (holdout_fraction
     of each sample) give the validation table: robust width of f / prediction per stratum, cell
     and diameter, 1 for a calibrated model.
@@ -307,15 +307,22 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
     sqrtN = np.asarray(sqrtN, float)
     nd = len(sqrtN)
     use_groups = k_groups > 1 and all('lognexp' in s for s in samples.values())
-    train, test = {}, {}
+    full, train, test = {}, {}, {}
     for i, s in samples.items():
         f = np.asarray(s['f'], float); logp = np.asarray(s['logp'], float)
         lognexp = np.asarray(s['lognexp'], float) if use_groups else np.zeros(len(f))
         ok = np.isfinite(f) & np.isfinite(logp) & np.isfinite(lognexp)
         f, logp, lognexp = f[ok], logp[ok], lognexp[ok]
+        full[i] = (f, logp, lognexp)
         is_test = rng.random(len(f)) < holdout_fraction
         train[i] = (f[~is_test], logp[~is_test], lognexp[~is_test])
         test[i] = (f[is_test], logp[is_test], lognexp[is_test])
+    # The structure (group and strata edges) is decided on all apertures of all diameters pooled,
+    # before the hold-out split, so that the validation fit and the production fit share it and
+    # the held-out widths test the structure that is used; the pooled count thresholds are
+    # min_count x nd, i.e. min_count apertures per diameter on average. A level whose apertures
+    # thin out with the aperture size (single-exposure strips, where few large apertures fit)
+    # keeps its group; its tilt is fitted with every diameter weighted by its count.
 
     # pooled (single-curve) fit: the legacy model, always stored, and the base of every tilt
     pooled = np.array([robust_width(train[i][0], width_method) / rms1 for i in range(nd)])
@@ -323,14 +330,14 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
     model = {'sqrtN': sqrtN, 'rmsN/rms1': pooled, 'rmsN_err/rms1': pooled_err, 'k': int(k)}
     model.update(fit_curve(sqrtN, pooled, pooled_err))
 
-    def fit_strata(masks, logq, k_s, allow_single, min_n=min_count, tails=TAIL_PERCENTILES):
-        """Strata of logq[i] among the apertures selected by masks[i]: edges on the diameter with the
-        fewest selected apertures (so every stratum is populated at every diameter), then the width
-        per stratum and diameter and its tilt on the pooled curve. Without edges the result is empty
-        (the pooled curve applies) unless allow_single, in which case the one stratum is the tilt of
-        the whole selection."""
-        i_min = min(train, key=lambda i: int(masks[i].sum()))
-        edges = strata_edges(logq[i_min][masks[i_min]], k_s, min_count=min_n, tail_percentiles=tails)
+    def fit_strata(masks_full, logq_full, masks, logq, k_s, allow_single, min_n=min_count, tails=TAIL_PERCENTILES):
+        """Strata of logq[i] among the apertures selected by masks[i]: edges from the pooled
+        selection of all apertures (masks_full/logq_full), then the width per stratum and diameter
+        on the training apertures and its tilt on the pooled curve. Without edges the result is
+        empty (the pooled curve applies) unless allow_single, in which case the one stratum is the
+        tilt of the whole selection."""
+        pooled_q = np.concatenate([logq_full[i][masks_full[i]] for i in full])
+        edges = strata_edges(pooled_q, k_s, min_count=min_n * nd, tail_percentiles=tails)
         strata = {'edges': edges.tolist(), 'log_centres': [], 'curves': [], 'rmsN/rms1': [], 'n': []}
         if len(edges) == 0 and not allow_single:
             return strata
@@ -348,24 +355,29 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
         return strata
 
     # 1-D strata in log p (the model when there is no exposure-count map, and the fallback)
+    everything_full = {i: np.ones(len(full[i][0]), bool) for i in full}
     everything = {i: np.ones(len(train[i][0]), bool) for i in train}
-    model['strata'] = fit_strata(everything, {i: train[i][1] for i in train}, k, allow_single=False)
+    model['strata'] = fit_strata(everything_full, {i: full[i][1] for i in full},
+                                 everything, {i: train[i][1] for i in train}, k, allow_single=False)
     n_strata = len(model['strata']['log_centres'])
 
     # 2-D: groups of exposure count x strata of depth per exposure
     groups = {'edges': [], 'log_centres': [], 'n': [], 'members': [], 'k_per_group': int(k_per_group)}
     if use_groups:
-        i_min = min(train, key=lambda i: len(train[i][0]))
-        gedges = group_edges(train[i_min][2], k_groups, min_count=min_count_cell)
+        all_n_full = np.concatenate([full[i][2] for i in full])
+        gedges = group_edges(all_n_full, k_groups, min_count=min_count_cell * nd)
         if len(gedges) >= 1:
+            logq_full = {i: full[i][1] - full[i][2] for i in full}
             logq = {i: train[i][1] - train[i][2] for i in train}
-            all_n = np.concatenate([train[i][2] for i in train]); all_g = np.digitize(all_n, gedges)
+            all_g = np.digitize(all_n_full, gedges)
             groups['edges'] = gedges.tolist()
             for g in range(len(gedges) + 1):
+                masks_full = {i: np.digitize(full[i][2], gedges) == g for i in full}
                 masks = {i: np.digitize(train[i][2], gedges) == g for i in train}
-                groups['log_centres'].append(float(np.median(all_n[all_g == g])))
+                groups['log_centres'].append(float(np.median(all_n_full[all_g == g])))
                 groups['n'].append([int(masks[i].sum()) for i in range(nd)])
-                groups['members'].append(fit_strata(masks, logq, k_per_group, allow_single=True, min_n=min_count_cell, tails=None))
+                groups['members'].append(fit_strata(masks_full, logq_full, masks, logq, k_per_group,
+                                                    allow_single=True, min_n=min_count_cell, tails=None))
     model['groups'] = groups
     n_groups = len(groups['log_centres'])
 
