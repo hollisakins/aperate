@@ -195,32 +195,47 @@ def group_edges(lognexp: np.ndarray, k: int, min_count: int = 300) -> np.ndarray
     members each.
 
     NEXP is nearly discrete (the local mean of an integer map, fractional only near exposure
-    edges), so the candidate edges are the midpoints, in log, between the integer levels present
-    in the data. The smallest bin is then merged into its smaller neighbour until no more than k
-    bins remain and each holds min_count members: on a field with a wide range of exposure
-    counts this gives quantile-like groups, on a uniform field no groups at all (the model then
-    reduces to the 1-D strata).
+    edges), so the bins start as the integer levels present in the data, split at the midpoints
+    in log. Adjacent bins are then merged agglomeratively with Ward's criterion on log NEXP,
+    cost = n_i n_j / (n_i + n_j) * (mean_i - mean_j)^2: a bin below min_count joins the
+    neighbour with the lower cost, and otherwise the cheapest adjacent pair is merged until no
+    more than k bins remain. Rare high exposure counts, which are close in log, are merged among
+    themselves first, while a single-exposure level stays separate from the two-exposure one (a
+    factor of 2) as long as it holds min_count apertures. A uniform field gives no groups (the
+    model then reduces to the 1-D strata).
     """
     x = np.asarray(lognexp, float)
     x = x[np.isfinite(x)]
     if k <= 1 or len(x) < 2 * min_count:
         return np.array([])
-    levels = np.unique(np.maximum(np.rint(np.exp(x)), 1.0))
+    level = np.maximum(np.rint(np.exp(x)), 1.0)
+    levels, counts = np.unique(level, return_counts=True)
     if len(levels) < 2:
         return np.array([])
-    edges = list(np.log(0.5 * (levels[1:] + levels[:-1])))
-    while edges:
-        counts = np.bincount(np.digitize(x, edges), minlength=len(edges) + 1)
-        if len(edges) + 1 <= k and counts.min() >= min_count:
-            break
-        i = int(np.argmin(counts))
-        if i == 0:
-            edges.pop(0)
-        elif i == len(edges):
-            edges.pop()
+    # bins: contiguous runs of levels; keep count, mean log NEXP and the level range of each
+    bins = [{'n': int(c), 'mean': float(np.mean(x[level == l])), 'lo': float(l), 'hi': float(l)} for l, c in zip(levels, counts)]
+
+    def cost(a, b):
+        return a['n'] * b['n'] / (a['n'] + b['n']) * (a['mean'] - b['mean']) ** 2
+
+    def merge(i):
+        a, b = bins[i], bins[i + 1]
+        n = a['n'] + b['n']
+        bins[i:i + 2] = [{'n': n, 'mean': (a['n'] * a['mean'] + b['n'] * b['mean']) / n, 'lo': a['lo'], 'hi': b['hi']}]
+
+    while len(bins) > 1:
+        small = [i for i, b in enumerate(bins) if b['n'] < min_count]
+        if small:
+            i = small[0]
+            cands = [j for j in (i - 1, i) if 0 <= j < len(bins) - 1]
+            merge(min(cands, key=lambda j: cost(bins[j], bins[j + 1])))
+        elif len(bins) > k:
+            merge(min(range(len(bins) - 1), key=lambda j: cost(bins[j], bins[j + 1])))
         else:
-            edges.pop(i - 1 if counts[i - 1] <= counts[i + 1] else i)
-    return np.array(edges)
+            break
+    if len(bins) < 2:
+        return np.array([])
+    return np.array([np.log(0.5 * (bins[i]['hi'] + bins[i + 1]['lo'])) for i in range(len(bins) - 1)])
 
 
 def robust_width(x: np.ndarray, method: str = 'negative_tail') -> float:
@@ -273,14 +288,17 @@ def negative_tail_width(x: np.ndarray, maxiters: int = 4) -> float:
 
 def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
               holdout_fraction: float = 0.2, min_count: int = 200, width_method: str = 'negative_tail',
-              rng: Optional[np.random.Generator] = None, k_groups: int = 1, k_per_group: int = 4) -> dict:
+              rng: Optional[np.random.Generator] = None, k_groups: int = 1, k_per_group: int = 4,
+              min_count_cell: int = 500) -> dict:
     """Fit the stratified curves.
 
     samples[i] = {'f': normalised aperture sums (sum / S) for diameter index i, 'logp': log proxy at
     the aperture, optionally 'lognexp': log of the local number of exposures}. rms1 is the
     single-pixel width of (image / S) (= 1 if S is the true pixel rms). k strata of log p are
     fitted; when every sample carries 'lognexp' and k_groups > 1, also up to k_groups groups of
-    exposure count with k_per_group strata of log(p / NEXP) each (see the module docstring).
+    exposure count with k_per_group strata of log(p / NEXP) each (see the module docstring); the
+    groups and their strata need min_count_cell apertures per diameter (no tail bins there:
+    a deep patch is a group of its own).
     Returns the model dictionary (JSON/pickle friendly); the held-out apertures (holdout_fraction
     of each sample) give the validation table: robust width of f / prediction per stratum, cell
     and diameter, 1 for a calibrated model.
@@ -305,14 +323,14 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
     model = {'sqrtN': sqrtN, 'rmsN/rms1': pooled, 'rmsN_err/rms1': pooled_err, 'k': int(k)}
     model.update(fit_curve(sqrtN, pooled, pooled_err))
 
-    def fit_strata(masks, logq, k_s, allow_single):
+    def fit_strata(masks, logq, k_s, allow_single, min_n=min_count, tails=TAIL_PERCENTILES):
         """Strata of logq[i] among the apertures selected by masks[i]: edges on the diameter with the
         fewest selected apertures (so every stratum is populated at every diameter), then the width
         per stratum and diameter and its tilt on the pooled curve. Without edges the result is empty
         (the pooled curve applies) unless allow_single, in which case the one stratum is the tilt of
         the whole selection."""
         i_min = min(train, key=lambda i: int(masks[i].sum()))
-        edges = strata_edges(logq[i_min][masks[i_min]], k_s, min_count=min_count)
+        edges = strata_edges(logq[i_min][masks[i_min]], k_s, min_count=min_n, tail_percentiles=tails)
         strata = {'edges': edges.tolist(), 'log_centres': [], 'curves': [], 'rmsN/rms1': [], 'n': []}
         if len(edges) == 0 and not allow_single:
             return strata
@@ -338,7 +356,7 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
     groups = {'edges': [], 'log_centres': [], 'n': [], 'members': [], 'k_per_group': int(k_per_group)}
     if use_groups:
         i_min = min(train, key=lambda i: len(train[i][0]))
-        gedges = group_edges(train[i_min][2], k_groups, min_count=min_count)
+        gedges = group_edges(train[i_min][2], k_groups, min_count=min_count_cell)
         if len(gedges) >= 1:
             logq = {i: train[i][1] - train[i][2] for i in train}
             all_n = np.concatenate([train[i][2] for i in train]); all_g = np.digitize(all_n, gedges)
@@ -347,7 +365,7 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
                 masks = {i: np.digitize(train[i][2], gedges) == g for i in train}
                 groups['log_centres'].append(float(np.median(all_n[all_g == g])))
                 groups['n'].append([int(masks[i].sum()) for i in range(nd)])
-                groups['members'].append(fit_strata(masks, logq, k_per_group, allow_single=True))
+                groups['members'].append(fit_strata(masks, logq, k_per_group, allow_single=True, min_n=min_count_cell, tails=None))
     model['groups'] = groups
     n_groups = len(groups['log_centres'])
 
@@ -355,7 +373,12 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
     val = {'overall': [], 'overall_single_curve': [], 'overall_strata': [], 'n_test': [],
            'by_stratum': [[None] * nd for _ in range(n_strata)],
            'by_group': [[None] * nd for _ in range(n_groups)],
-           'by_cell': [[[None] * nd for _ in range(len(m['log_centres']))] for m in groups['members']]}
+           'by_cell': [[[None] * nd for _ in range(len(m['log_centres']))] for m in groups['members']],
+           'levels': [], 'by_level': [], 'by_level_strata': []}
+    if use_groups:
+        all_levels = np.unique(np.maximum(np.rint(np.exp(np.concatenate([test[i][2] for i in test]))), 1.0))
+        val['levels'] = [int(l) for l in all_levels]
+        val['by_level'] = [[None] * nd for _ in all_levels]; val['by_level_strata'] = [[None] * nd for _ in all_levels]
     for i in range(nd):
         f, logp, lognexp = test[i]
         val['n_test'].append(int(len(f)))
@@ -376,6 +399,13 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
                 sel = b == s
                 if sel.sum() >= MIN_TEST:
                     val['by_stratum'][s][i] = robust_width(f[sel] / pred_s[sel], width_method)
+        if use_groups:
+            lev = np.maximum(np.rint(np.exp(lognexp)), 1.0)
+            for li, l in enumerate(val['levels']):
+                sel = lev == l
+                if sel.sum() >= MIN_TEST:
+                    val['by_level'][li][i] = robust_width(f[sel] / pred[sel], width_method)
+                    val['by_level_strata'][li][i] = robust_width(f[sel] / pred_s[sel], width_method)
         if n_groups > 1:
             gb = np.digitize(lognexp, groups['edges'])
             for g in range(n_groups):
