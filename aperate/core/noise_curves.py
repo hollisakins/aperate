@@ -297,8 +297,9 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
     single-pixel width of (image / S) (= 1 if S is the true pixel rms). k strata of log p are
     fitted; when every sample carries 'lognexp' and k_groups > 1, also up to k_groups groups of
     exposure count with k_per_group strata of log(p / NEXP) each (see the module docstring); the
-    groups and their strata need min_count_cell apertures per diameter on average (no tail bins
-    there: a deep patch is a group of its own).
+    groups and their strata need min_count_cell apertures per diameter on average; the strata
+    within a group carry the same upper tail bins as the 1-D strata, because the deepest
+    per-exposure patches (a few per cent of a many-exposure group) have their own curve.
     Returns the model dictionary (JSON/pickle friendly); the held-out apertures (holdout_fraction
     of each sample) give the validation table: robust width of f / prediction per stratum, cell
     and diameter, 1 for a calibrated model.
@@ -377,7 +378,7 @@ def fit_model(samples: Dict[int, dict], sqrtN: np.ndarray, rms1: float, k: int,
                 groups['log_centres'].append(float(np.median(all_n_full[all_g == g])))
                 groups['n'].append([int(masks[i].sum()) for i in range(nd)])
                 groups['members'].append(fit_strata(masks_full, logq_full, masks, logq, k_per_group,
-                                                    allow_single=True, min_n=min_count_cell, tails=None))
+                                                    allow_single=True, min_n=min_count_cell))
     model['groups'] = groups
     n_groups = len(groups['log_centres'])
 
