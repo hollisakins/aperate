@@ -340,7 +340,7 @@ class RandomAperturesConfig(_Section):
     holdout_fraction: float = 0.2      # apertures kept back for the validation fit only; the production fit uses all
     check_weight_map: bool = True      # compare the weight map with the empirical noise before trusting it
     parallel: int = 1                  # tiles sampled in parallel (processes)
-    # with an 'nexp' image extension (number of exposures per pixel): up to nexp_groups groups of
+    # with an 'exp' image extension (exposure map with an NEXP plane): up to nexp_groups groups of
     # exposure count, each with nexp_strata strata of depth per exposure; nexp_groups = 1 ignores the map
     nexp_groups: int = 5
     nexp_strata: int = 4

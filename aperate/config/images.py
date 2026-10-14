@@ -27,6 +27,9 @@ from ..core.logging import get_logger, print_error
 from ..utils.helpers import fits_stem
 
 
+EXP_NEXP_HDU = 'NEXP'      # name of the exposure-count plane in the 'exp' extension file
+
+
 @dataclass
 class ImageFiles:
     """Container for image files for a specific filter/tile combination."""
@@ -58,9 +61,12 @@ class ImageFiles:
         """Get path to weight image."""
         return self.get_full_path('wht')
     
-    def get_nexp_path(self) -> Optional[Path]:
-        """Path to the exposure-count map (number of exposures per pixel), if any."""
-        return self.get_full_path('nexp')
+    def get_exp_path(self) -> Optional[Path]:
+        """Path to the exposure map, if any: a multi-extension file on the science grid with an
+        'EXPTIME' image (summed exposure time per pixel, s) and an 'NEXP' image (number of
+        exposures per pixel, 0 where the science image has no coverage). Readers select the
+        plane by name (EXP_NEXP_HDU); the first image HDU is EXPTIME."""
+        return self.get_full_path('exp')
 
     def get_rms_path(self) -> Optional[Path]:
         """Get path to RMS image."""

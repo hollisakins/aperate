@@ -17,7 +17,7 @@ from astropy.wcs import WCS
 from ..core.catalog import find_catalog_in_directory
 from ..core.logging import get_logger
 from ..config.parser import load_config
-from ..config.images import load_images_config, load_segmentation_map, ImagesConfig, ImageFiles
+from ..config.images import load_images_config, load_segmentation_map, ImagesConfig, ImageFiles, EXP_NEXP_HDU
 from ..config.psfs import load_psfs_config, PSFsConfig
 from ..config.schema import PhotometryConfig, AperateConfig
 from ..utils.helpers import get_unit_conversion
@@ -324,15 +324,6 @@ def _local_median(image: np.ndarray, x_pos, y_pos, r: float = 5.0, chunk: int = 
     return out
 
 
-def _first_data_hdu(path) -> int:
-    """Index of the first HDU with image data (0 for a plain image, 1 for a compressed one)."""
-    with fits.open(path) as hdul:
-        for i, hdu in enumerate(hdul):
-            if hdu.data is not None and np.ndim(hdu.data) >= 2:
-                return i
-    raise ValueError(f'{path}: no image HDU')
-
-
 def compute_weights(ctx: PhotometryContext, filter_name: str, image_files) -> Table:
     """
     Compute the local weight and rms values at source positions.
@@ -360,12 +351,12 @@ def compute_weights(ctx: PhotometryContext, filter_name: str, image_files) -> Ta
     else:
         logger.warning(f"        Could not find rms map for {filter_name}")
 
-    if image_files.has_extension('nexp'):
-        # number of exposures: the local mean (fractional near exposure edges), the same
+    if image_files.has_extension('exp'):
+        # number of exposures: the NEXP plane of the exposure map (its first image HDU is the
+        # exposure time), as the local mean (fractional near exposure edges), the same
         # definition as the random apertures use (noise_curves.PROXY_RADIUS)
-        nexp_path = image_files.get_nexp_path()
-        nexp = ctx.load_image(nexp_path, hdu_index=_first_data_hdu(nexp_path))
-        ctx.catalog[f'nexp_{filter_name}'] = _local_median(nexp.astype(np.float32), x_pos, y_pos, stat='mean').astype(np.float32)
+        nexp = ctx.load_image(image_files.get_exp_path(), hdu_index=EXP_NEXP_HDU)
+        ctx.catalog[f'nexp_{filter_name}'] = _local_median(nexp, x_pos, y_pos, stat='mean').astype(np.float32)
 
     return ctx.catalog
 

@@ -16,7 +16,7 @@ from scipy.interpolate import griddata, BSpline, make_splrep
 from ..core.catalog import find_catalog_in_directory, AperateCatalog
 from ..core.logging import get_logger
 from ..config.parser import load_config
-from ..config.images import load_images_config
+from ..config.images import load_images_config, EXP_NEXP_HDU
 from ..config.psfs import load_psfs_config
 from ..config.schema import PostprocessConfig, AperateConfig
 from ..utils.helpers import get_unit_conversion
@@ -184,12 +184,18 @@ def merge_tile_catalogs(
     return catalog_merged
 
 
-def load_map(path) -> np.ndarray:
-    """Data of the first HDU that has any (a plain image or a compressed image extension)."""
+def load_map(path, hdu: Optional[str] = None) -> np.ndarray:
+    """Data of the HDU named hdu, or of the first HDU that has any (a plain image or a
+    compressed image extension). The exposure map ('exp' extension) holds several planes, so
+    its readers must name the one they want (EXP_NEXP_HDU for the exposure count)."""
     with fits.open(path) as hdul:
-        for hdu in hdul:
-            if hdu.data is not None and np.ndim(hdu.data) >= 2:
-                return np.asarray(hdu.data)
+        if hdu is not None:
+            if hdu not in hdul:
+                raise ValueError(f'{path}: no HDU named {hdu!r} (found {[h.name for h in hdul]})')
+            return np.asarray(hdul[hdu].data)
+        for h in hdul:
+            if h.data is not None and np.ndim(h.data) >= 2:
+                return np.asarray(h.data)
     raise ValueError(f'{path}: no image HDU')
 
 
@@ -222,12 +228,12 @@ def _sample_tile_task(args):
     Returns the normalised sums per radius, the log depth proxies (one array per available proxy
     map) and a pixel sample; see aperate.core.noise_curves.sample_image.
     """
-    (sci_path, rms_path, wht_path, nexp_path, segmap_path, scale_kind, proxy_kind, check_wht, diameters, pixel_scale,
+    (sci_path, rms_path, wht_path, exp_path, segmap_path, scale_kind, proxy_kind, check_wht, diameters, pixel_scale,
      density, min_density, mask_dilate, seed, source_positions, balance_bins) = args
     from ..core import noise_curves as nc
 
-    def load(path):
-        return np.ascontiguousarray(load_map(path).astype(np.float32))
+    def load(path, hdu=None):
+        return np.ascontiguousarray(load_map(path, hdu).astype(np.float32))
 
     sci = load(sci_path)
     valid = np.isfinite(sci)
@@ -238,10 +244,10 @@ def _sample_tile_task(args):
     if wht_path is not None and (scale_kind == 'wht' or proxy_kind == 'wht' or check_wht):
         maps['wht'] = load(wht_path)
         valid &= np.isfinite(maps['wht']) & (maps['wht'] > 0)
-    if nexp_path is not None:
-        maps['nexp'] = load(nexp_path)
+    if exp_path is not None:
+        maps['nexp'] = load(exp_path, EXP_NEXP_HDU)
         if maps['nexp'].shape != sci.shape:
-            raise ValueError(f'{nexp_path}: the exposure-count map has shape {maps["nexp"].shape}, the image {sci.shape}')
+            raise ValueError(f'{exp_path}: the exposure-count plane has shape {maps["nexp"].shape}, the image {sci.shape}')
         valid &= np.isfinite(maps['nexp']) & (maps['nexp'] > 0)
     source_mask = None
     if segmap_path is not None:
@@ -314,7 +320,7 @@ def measure_random_apertures(
     apertures of all tiles are pooled and `aperate.core.noise_curves.fit_model` fits one curve
     sigma_N/sigma_1 versus sqrt(N) per depth stratum (depth_strata quantile bins of the depth
     proxy plus tail bins; depth_strata = 1 is the single-curve model). When the filter's images
-    have an 'nexp' extension (number of exposures per pixel) the strata are two-dimensional:
+    have an 'exp' extension (exposure map with an NEXP plane: exposures per pixel) the strata are two-dimensional:
     up to nexp_groups groups of exposure count, each with nexp_strata strata of the depth per
     exposure (proxy / NEXP); nexp_groups = 1 ignores the map. Apertures avoid the segmentation
     map (mask_sources) and invalid pixels. 20% of the apertures (holdout_fraction) are kept back
@@ -364,7 +370,7 @@ def measure_random_apertures(
                 image_files = images_config.get_image_files(filt, tile)
                 sci_path = image_files.get_homogenized_path(psfs_config.target_filter) if homogenized else image_files.get_science_path()
                 scale_kind, proxy_kind = _resolve_noise_maps(image_files, depth_proxy, scale_map)
-                has_nexp = nexp_groups > 1 and bool(image_files.has_extension('nexp'))
+                has_nexp = nexp_groups > 1 and bool(image_files.has_extension('exp'))
                 kinds.add((scale_kind, proxy_kind, has_nexp))
                 header = fits.getheader(sci_path)
                 with warnings.catch_warnings():
@@ -387,7 +393,7 @@ def measure_random_apertures(
                 tasks.append((str(sci_path),
                               str(image_files.get_rms_path()) if image_files.has_extension('rms') else None,
                               str(image_files.get_weight_path()) if image_files.has_extension('wht') else None,
-                              str(image_files.get_nexp_path()) if has_nexp else None,
+                              str(image_files.get_exp_path()) if has_nexp else None,
                               str(segmap_path) if segmap_path is not None else None,
                               scale_kind, proxy_kind, check_weight_map and proxy_kind == 'wht',
                               aperture_diameters.tolist(), pixel_scale,
@@ -620,7 +626,7 @@ def _object_noise_inputs(catalog: Table, filt: str, model: dict, empirical_file:
             with np.errstate(divide='ignore', invalid='ignore'):
                 log_nexp = np.where(e > 0, np.log(e), np.nan)
         else:
-            logger.warning(f"{filt}: catalog has no nexp_{filt} column (photometry run without the nexp extension); "
+            logger.warning(f"{filt}: catalog has no nexp_{filt} column (photometry run without the exp extension); "
                            f"using the depth strata without exposure-count groups")
     return scale, log_proxy, log_nexp
 
