@@ -58,19 +58,29 @@ catalog_name/
 - TOML config files with validation
 - FITS format for catalogs and metadata
 
-## Development Notes
-**IMPORTANT**: Much of the core functionality is being migrated from another project. Claude Code will typically handle package structure, CLI setup, and integration - the user will provide the core astronomical processing algorithms.
+## Image extensions
+Standard extension names after mapping: `sci`, `err`, `wht`, `rms`, `exp`. `exp` is an optional
+exposure map: PRIMARY + `EXPTIME` (float32, seconds) + `NEXP` (int16 exposure count), same grid as
+`sci`, zero where `sci` is NaN. Read planes by HDU name (`EXP_NEXP_HDU` in `aperate/config/images.py`);
+the first image HDU is EXPTIME. Photometry records the local mean NEXP per filter (`nexp_<filter>`),
+and postprocess stratifies the empirical noise model by exposure count when the extension exists.
 
-## Development Setup
-Project setup pending. Will need:
-- pyproject.toml for package configuration
-- requirements.txt for dependencies
-- Testing framework (pytest)
-- Code formatting (black, ruff)
+## Conventions
+- `config.toml` is validated by the pydantic schema in `aperate/config/schema.py` (unknown keys are
+  rejected). `aperate/example_config.toml` must stay valid against it.
+- Pipeline state lives in FITS headers: per-filter corrections (`KRONCORR`, `APERCORR`) in the tile
+  catalogs, step state (`PSFCORR`, `ERRCAL`, `EXTCORR`) in the merged catalog. Steps are idempotent and
+  consult these records before applying.
+- `merge_tile_catalogs` detaches each tile's header metadata before stacking and writes one summary
+  (`TILES`, `NTILES`, union of corrections). Never `vstack` tables that carry list-valued `meta`
+  sequentially: astropy concatenates the lists at every step and the header grows exponentially.
+- Noise model (`aperate/core/noise_curves.py`): sigma = sigma1 * c_s(sqrt N) * S(x), with one curve per
+  depth stratum (and per exposure-count group when `exp` exists), fitted on random apertures with a
+  hold-out validation fit. Keep `tests/test_noise_curves*.py` passing when changing it.
 
-## Common Commands
-To be established once package structure is created:
-- Package installation: `pip install -e .`
-- Running tests: `pytest`
-- Code formatting and linting
-- CLI usage: `aperate <subcommand>` (from project directory)
+## Development
+- Install: `pip install -e .` (editable). After pulling, check `python -c "import aperate; print(aperate.__file__)"`
+  points at the source tree.
+- Tests: `pytest` (synthetic images only, no external data; runs in under a minute).
+- Lint/format: `ruff` and `black`, settings in `pyproject.toml`.
+- CLI: `aperate <subcommand>` from the project directory.

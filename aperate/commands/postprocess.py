@@ -16,14 +16,16 @@ from scipy.interpolate import griddata, BSpline, make_splrep
 from ..core.catalog import find_catalog_in_directory, AperateCatalog
 from ..core.logging import get_logger
 from ..config.parser import load_config
-from ..config.images import load_images_config
+from ..config.images import load_images_config, EXP_NEXP_HDU
 from ..config.psfs import load_psfs_config
 from ..config.schema import PostprocessConfig, AperateConfig
 from ..utils.helpers import get_unit_conversion
 
 from .detect import fit_pixel_dist
 
+import json
 import pickle
+import sep
 from scipy.optimize import curve_fit
 from photutils.aperture import EllipticalAperture, CircularAperture, aperture_photometry
 from astropy.wcs import WCS, FITSFixedWarning
@@ -51,6 +53,75 @@ def distance_to_nearest_edge(x, y, image_width, image_height):
         return np.min([left_edge_dist, right_edge_dist, top_edge_dist, bottom_edge_dist], axis=0)
     else:
         return min(left_edge_dist, right_edge_dist, top_edge_dist, bottom_edge_dist)
+
+
+def _take_meta(catalog: Table) -> dict:
+    """Detach a tile catalog's metadata before it enters a merge and return it.
+
+    A FITS header read into Table.meta turns repeated cards (KRONCORR/APERCORR written as
+    one card per filter, COMMENT, HISTORY) into lists, and astropy's vstack concatenates list
+    values of every input. Merging tiles one at a time with the running catalog among the
+    inputs therefore doubles such lists at every step (2^19 x 38 cards for 20 cosmos tiles:
+    80 GB of header and a write that never finished). The merge keeps the pieces free of
+    metadata and writes one summary (_merged_meta) at the end, so growth is bounded by the
+    number of distinct values whatever keys future tile catalogs carry.
+    """
+    from .photometry import CORRECTION_STATE_KEYS
+    meta = {k: (list(v) if isinstance(v, (list, tuple)) else v) for k, v in catalog.meta.items()}
+    # the filters whose columns the tile has, per correction: what its record should list
+    meta['_corr_columns'] = {key: {c[len(prefix):] for c in catalog.colnames if c.startswith(prefix)}
+                             for key, prefix in zip(CORRECTION_STATE_KEYS, ('f_auto_', 'f_aper_hom_'))}
+    catalog.meta = {}
+    return meta
+
+
+def _merged_meta(tile_meta: Dict[str, dict]) -> dict:
+    """One record per key for the merged catalog, from the per-tile metadata.
+
+    Correction-state keys (KRONCORR/APERCORR, the filters whose columns carry the kron and
+    aperture corrections) become the comma-separated list used in the tile primary headers,
+    as the union over tiles; a tile that has a filter's columns without recording the
+    correction for it is reported with a warning, since the merged rows then mix corrected
+    and uncorrected values of that filter (tiles may legitimately cover different filters).
+    Other list values
+    (COMMENT/HISTORY) are deduplicated in order; scalar values are kept when every tile that
+    has them agrees and otherwise dropped with a warning. TILES/NTILES record the provenance.
+    """
+    from .photometry import CORRECTION_STATE_KEYS
+    logger = get_logger()
+    out = {}
+    columns = {t: m.pop('_corr_columns', {}) for t, m in tile_meta.items()}
+    keys = []
+    for m in tile_meta.values():
+        keys += [k for k in m if k not in keys]
+    for key in keys:
+        present = {t: m[key] for t, m in tile_meta.items() if key in m}
+        if key in CORRECTION_STATE_KEYS:
+            sets = {t: set(v if isinstance(v, list) else [f for f in str(v).split(',') if f]) for t, v in present.items()}
+            differ = {t: sorted(columns[t].get(key, set()) - sets.get(t, set())) for t in tile_meta}
+            differ = {t: d for t, d in differ.items() if d}
+            if differ:
+                detail = '; '.join(f'{t}: {", ".join(d)}' for t, d in differ.items())
+                logger.warning(f'{key}: some tiles have columns of filters without the correction recorded ({detail}); '
+                               f'their rows mix corrected and uncorrected values; the merged catalog records the union')
+            order = []
+            for v in present.values():
+                order += [f for f in (v if isinstance(v, list) else str(v).split(',')) if f and f not in order]
+            out[key] = ','.join(order)
+        elif any(isinstance(v, list) for v in present.values()):
+            seen = []
+            for v in present.values():
+                seen += [x for x in (v if isinstance(v, list) else [v]) if x not in seen]
+            out[key] = seen
+        else:
+            values = {repr(v) for v in present.values()}
+            if len(values) == 1:
+                out[key] = next(iter(present.values()))
+            else:
+                logger.warning(f'{key}: the tile catalogs carry different values ({len(values)} distinct); not recorded in the merged catalog')
+    out['TILES'] = ','.join(tile_meta)
+    out['NTILES'] = len(tile_meta)
+    return out
 
 
 def merge_tile_catalogs(
@@ -111,6 +182,7 @@ def merge_tile_catalogs(
     tile0 = tiles[0]
     catalog0_path = project_dir / "catalogs" / f"catalog_{project_name}_{tile0}.fits"
     catalog0 = Table.read(catalog0_path)
+    tile_meta = {tile0: _take_meta(catalog0)}
     catalog0['tile'] = tile0
     catalog0['id_tile'] = catalog0['id']
 
@@ -129,6 +201,7 @@ def merge_tile_catalogs(
     for tile1 in tiles[1:]:
         catalog1_path = project_dir / "catalogs" / f"catalog_{project_name}_{tile1}.fits"
         catalog1 = Table.read(catalog1_path)
+        tile_meta[tile1] = _take_meta(catalog1)
         catalog1['tile'] = tile1
         catalog1['id_tile'] = catalog1['id']
 
@@ -176,10 +249,115 @@ def merge_tile_catalogs(
     
     # Reassign IDs
     catalog_merged['id'] = np.arange(len(catalog_merged)).astype(int)
+    catalog_merged.meta = _merged_meta(tile_meta)
     
     catalog_merged.write(output_path, overwrite=True)
     
     return catalog_merged
+
+
+def load_map(path, hdu: Optional[str] = None) -> np.ndarray:
+    """Data of the HDU named hdu, or of the first HDU that has any (a plain image or a
+    compressed image extension). The exposure map ('exp' extension) holds several planes, so
+    its readers must name the one they want (EXP_NEXP_HDU for the exposure count)."""
+    with fits.open(path) as hdul:
+        if hdu is not None:
+            if hdu not in hdul:
+                raise ValueError(f'{path}: no HDU named {hdu!r} (found {[h.name for h in hdul]})')
+            return np.asarray(hdul[hdu].data)
+        for h in hdul:
+            if h.data is not None and np.ndim(h.data) >= 2:
+                return np.asarray(h.data)
+    raise ValueError(f'{path}: no image HDU')
+
+
+def _random_aperture_products(output_dir: Path, filt: str, homogenized: bool):
+    suffix = '_psfhom' if homogenized else ''
+    base = output_dir / f'random_apertures_{filt}{suffix}'
+    return (base.with_name(base.name + '_coeffs.pickle'), base.with_name(base.name + '_validation.json'),
+            base.with_name(base.name + '_empirical.npz'), base.with_name(base.name + '_coeffs.png'))
+
+
+def _resolve_noise_maps(image_files, depth_proxy: str, scale_map: str):
+    """Which maps provide the scale S(x) and the depth proxy p(x) for this filter's images."""
+    has = {e: bool(image_files.has_extension(e)) for e in ('rms', 'wht')}
+    scale = scale_map
+    if scale == 'auto':
+        scale = 'rms' if has['rms'] else ('wht' if has['wht'] else 'empirical')
+    elif scale in has and not has[scale]:
+        raise ValueError(f"random_apertures.scale_map = '{scale}' but the images have no '{scale}' extension")
+    proxy = depth_proxy
+    if proxy == 'auto':
+        proxy = 'wht' if has['wht'] else ('rms' if has['rms'] else 'empirical')
+    elif proxy in has and not has[proxy]:
+        raise ValueError(f"random_apertures.depth_proxy = '{proxy}' but the images have no '{proxy}' extension")
+    return scale, proxy
+
+
+def _sample_tile_task(args):
+    """Worker: random apertures on one tile for one filter (native or PSF-homogenized image).
+
+    Returns the normalised sums per radius, the log depth proxies (one array per available proxy
+    map) and a pixel sample; see aperate.core.noise_curves.sample_image.
+    """
+    (sci_path, rms_path, wht_path, exp_path, segmap_path, scale_kind, proxy_kind, check_wht, diameters, pixel_scale,
+     density, min_density, mask_dilate, seed, source_positions, balance_bins) = args
+    from ..core import noise_curves as nc
+
+    def load(path, hdu=None):
+        return np.ascontiguousarray(load_map(path, hdu).astype(np.float32))
+
+    sci = load(sci_path)
+    valid = np.isfinite(sci)
+    maps = {}
+    if rms_path is not None and (scale_kind == 'rms' or proxy_kind == 'rms'):
+        maps['rms'] = load(rms_path)
+        valid &= np.isfinite(maps['rms']) & (maps['rms'] > 0)
+    if wht_path is not None and (scale_kind == 'wht' or proxy_kind == 'wht' or check_wht):
+        maps['wht'] = load(wht_path)
+        valid &= np.isfinite(maps['wht']) & (maps['wht'] > 0)
+    if exp_path is not None:
+        maps['nexp'] = load(exp_path, EXP_NEXP_HDU)
+        if maps['nexp'].shape != sci.shape:
+            raise ValueError(f'{exp_path}: the exposure-count plane has shape {maps["nexp"].shape}, the image {sci.shape}')
+        valid &= np.isfinite(maps['nexp']) & (maps['nexp'] > 0)
+    source_mask = None
+    if segmap_path is not None:
+        source_mask = np.asarray(fits.getdata(segmap_path)) > 0
+    emp = None
+    if scale_kind == 'empirical' or proxy_kind == 'empirical' or (check_wht and 'wht' in maps):
+        bad = ~valid if source_mask is None else (~valid | source_mask)
+        emp = nc.empirical_noise_map(sci, bad)
+        valid &= np.isfinite(emp) & (emp > 0)
+        maps['empirical'] = emp
+    if scale_kind == 'wht':
+        with np.errstate(divide='ignore', invalid='ignore'):
+            scale = np.where(valid, 1.0 / np.sqrt(maps['wht']), 0).astype(np.float32)
+    else:
+        scale = maps[scale_kind]
+    proxies = {k: maps[k] for k in ('wht', 'rms', 'empirical', 'nexp') if k in maps}
+
+    n_valid = int(valid.sum())
+    area = n_valid * pixel_scale ** 2 / 3600       # arcmin^2
+    # the same number of apertures at every diameter (sep makes large apertures cheap); the
+    # strata need a few hundred apertures each at the largest diameter too
+    nap = max(int(density * area), int(min_density * area), 0)
+    radii_pix = [d / 2 / pixel_scale for d in diameters]
+    n_apertures = [nap] * len(diameters)
+
+    rng = np.random.default_rng(seed)
+    # the proxy to balance on is the first map in the dict: order it first
+    proxies = {k: proxies[k] for k in ([proxy_kind] if proxy_kind in proxies else []) + [k for k in proxies if k != proxy_kind]}
+    out = nc.sample_image(sci, scale, proxies, valid, radii_pix, n_apertures, source_mask, mask_dilate, rng,
+                          balance_bins=balance_bins)
+    out['area_arcmin2'] = area
+    out['wht_check'] = (nc.weight_map_check(maps['wht'], emp, valid, rng)
+                        if (check_wht and 'wht' in maps and emp is not None) else None)
+    if source_positions is not None and emp is not None:
+        from .photometry import _local_median
+        ids, x, y = source_positions
+        out['empirical_at_sources'] = (np.asarray(ids), _local_median(emp, x, y))
+    return out
 
 
 def measure_random_apertures(
@@ -194,457 +372,421 @@ def measure_random_apertures(
     output_dir: Path,
     overwrite: bool = False,
     min_num_apertures_per_sq_arcmin: int = 30,
+    depth_strata: int = 8,
+    depth_proxy: str = 'auto',
+    scale_map: str = 'auto',
+    mask_sources: bool = True,
+    mask_dilate: int = 3,
+    holdout_fraction: float = 0.2,
+    check_weight_map: bool = True,
+    parallel: int = 1,
+    project_dir: Optional[Path] = None,
+    project_name: Optional[str] = None,
+    nexp_groups: int = 5,
+    nexp_strata: int = 4,
 ) -> None:
     """
-    Measure random aperture fluxes for uncertainty calibration.
-    
-    This function measures random apertures on both native-resolution and PSF-homogenized
-    images to calibrate flux uncertainties separately for each image type.
-    
-    Args:
-        images_config: ImagesConfig object
-        psfs_config: PSFsConfig object (or None if no PSF homogenization)
-        tiles: List of tiles to process
-        filters: List of filters to process
-        min_radius: Minimum aperture radius (arcsec)
-        max_radius: Maximum aperture radius (arcsec)
-        num_radii: Number of aperture sizes to sample
-        num_apertures_per_sq_arcmin: Number of apertures per sq arcmin
-        output_dir: Directory for output files
-        overwrite: Whether to overwrite existing files
-        
-    Implementation notes for user:
-    - Create logarithmically spaced aperture radii from min_radius to max_radius
-    - For each tile/filter combination, measure random apertures on:
-      1. Native-resolution images (always)
-      2. PSF-homogenized images (if psfs_config is not None and filter has homogenized images)
-    - For PSF-homogenized measurements:
-      - Target filter and inverse filters use native images
-      - Other filters use homogenized images (if available)
-    - Output files should be named:
-      - random_apertures_{tile}_{filter}_native.fits
-      - random_apertures_{tile}_{filter}_homogenized.fits
-    - Include metadata about which image type was used for each measurement
+    Measure random apertures and fit the stratified noise curves for every filter.
+
+    For each filter (and for its PSF-homogenized image when one is used for photometry) the
+    apertures of all tiles are pooled and `aperate.core.noise_curves.fit_model` fits one curve
+    sigma_N/sigma_1 versus sqrt(N) per depth stratum (depth_strata quantile bins of the depth
+    proxy plus tail bins; depth_strata = 1 is the single-curve model). When the filter's images
+    have an 'exp' extension (exposure map with an NEXP plane: exposures per pixel) the strata are two-dimensional:
+    up to nexp_groups groups of exposure count, each with nexp_strata strata of the depth per
+    exposure (proxy / NEXP); nexp_groups = 1 ignores the map. Apertures avoid the segmentation
+    map (mask_sources) and invalid pixels. 20% of the apertures (holdout_fraction) are kept back
+    to report the calibration of the fitted model per stratum, cell and aperture size
+    (random_apertures_<filter>[_psfhom]_validation.json and the check plot).
+
+    Maps: scale_map = rms map | 1/sqrt(wht) | empirical noise map (sep.Background of the masked
+    image); depth_proxy = wht | rms | empirical; 'auto' takes the first available. When
+    check_weight_map is set and the weight map is the proxy, it is compared with the empirical
+    noise map on the fly and replaced by it if it does not order pixels by depth.
+
+    Output: random_apertures_<filter>[_psfhom]_coeffs.pickle (model dict, readable by
+    _get_random_aperture_curve), the validation JSON, a PNG check plot, and, when the empirical
+    map is used, random_apertures_<filter>[_psfhom]_empirical.npz with the map value at every
+    catalogued source (tile, id, value) for calibrate_flux_uncertainties.
     """
     logger = get_logger()
+    from ..core import noise_curves as nc
     logger.info(f"Measuring random apertures for {len(tiles)} tiles x {len(filters)} filters")
     logger.info(f"Aperture range: {min_radius:.3f} - {max_radius:.3f} arcsec ({num_radii} steps)")
-    logger.info(f"Density: {num_apertures_per_sq_arcmin} apertures per sq arcmin")
+    logger.info(f"Density: {num_apertures_per_sq_arcmin} apertures per sq arcmin; depth strata: {depth_strata}; "
+                f"proxy: {depth_proxy}; scale: {scale_map}; exposure-count groups: {nexp_groups} x {nexp_strata} strata; "
+                f"parallel: {parallel}")
 
     index = 2
-    aperture_diameters = np.power(np.linspace(np.power(min_radius*2, 1/index), np.power(max_radius*2, 1/index), num_radii), index) # arcsec
+    aperture_diameters = np.power(np.linspace(np.power(min_radius*2, 1/index), np.power(max_radius*2, 1/index), num_radii), index)  # arcsec
 
     for filt in filters:
-
         if psfs_config is None or filt == psfs_config.target_filter or filt in psfs_config.inverse_filters:
             runs = [False]
         else:
             runs = [False, True]
 
         for homogenized in runs:
-
-            if homogenized:
-                output_file = output_dir / f'random_apertures_{filt}_psfhom_coeffs.pickle'
-            else:
-                output_file = output_dir / f'random_apertures_{filt}_coeffs.pickle'
-
+            pickle_file, validation_file, empirical_file, plot_file = _random_aperture_products(output_dir, filt, homogenized)
             imgtype = 'psf-homogenized' if homogenized else 'native resolution'
-            
-            if not output_file.exists() or overwrite:
-                logger.info(f'Measuring random aperture scaling for {filt} ({imgtype})')
+            if pickle_file.exists() and not overwrite:
+                logger.info(f'Skipping random aperture measurement for {filt} ({imgtype}): {pickle_file.name} exists')
+                if not plot_file.exists():
+                    _plot_random_apertures(pickle.load(open(pickle_file, 'rb')), filt, imgtype, plot_file)
+                continue
 
-
-                tiles = images_config.get_tiles_for_filter(filt)
-            
-                # First, fit the pixel distribution of the NSCI image to get the baseline single-pixel RMS 
-                logger.info('Fitting pixel distribution')
-                nrandom_pixels_per_tile = 50000
-
-                fluxes = np.zeros(nrandom_pixels_per_tile*len(tiles))
-                i = 0
-                for tile in tqdm.tqdm(tiles):
-
-                    image_files = images_config.get_image_files(filt, tile)
-
-                    if homogenized: 
-                        sci_path = image_files.get_homogenized_path(psfs_config.target_filter)
-                        with fits.open(sci_path) as sci_hdul:
-                            sci = sci_hdul[0].data
-                    else:
-                        sci_path = image_files.get_science_path()
-                        with fits.open(sci_path) as sci_hdul:
-                            sci = sci_hdul[0].data
-
-                    if image_files.has_extension('rms'):
-                        rms_path = image_files.get_rms_path()
-                        logger.debug(f"Using rms image -> {rms_path.name}")
-                        with fits.open(rms_path) as hdul:
-                            rms = hdul[0].data
-                    else: 
-                        wht_path = image_files.get_weight_path()
-                        logger.debug(f"No rms image found, using wht image -> {wht_path.name}")
-                        with fits.open(wht_path) as hdul:
-                            with warnings.catch_warnings():
-                                warnings.simplefilter('ignore', category=RuntimeWarning)
-                                rms = 1/np.sqrt(hdul[0].data)
-                    
-                    sci = sci.astype(sci.dtype.newbyteorder('='))
-                    rms = rms.astype(rms.dtype.newbyteorder('='))
-
-                    with warnings.catch_warnings():
-                        warnings.simplefilter('ignore', category=RuntimeWarning)
-                        nsci = sci/rms
-                    
-                    nsci[(rms <= 0)|~np.isfinite(rms)] = np.nan
-                    nsci = nsci[np.isfinite(nsci)]
-
-                    if nsci.size == 0:
-                        # Tile file exists but has no valid pixels (sparse HST bands) -- skip it
-                        logger.warning(f'{filt} {tile}: no valid pixels, skipping in pixel-distribution fit')
-                        continue
-
-                    # Select a subset of pixels to do the fitting — no need to use all of them (its slow)
-                    nsci = np.random.choice(nsci, size=nrandom_pixels_per_tile)
-                    fluxes[i:i+nrandom_pixels_per_tile] = nsci
-                    i += nrandom_pixels_per_tile
-
-                fluxes = fluxes[:i]  # drop unfilled slots from skipped tiles
-                if i == 0:
-                    raise ValueError(f'{filt}: no valid pixels in any tile for random apertures')
-                _, rms1 = fit_pixel_dist(fluxes, sigma_upper=1.0, maxiters=5)
-                rms1_random = 1
-
-
-                logger.info('Getting random aperture fluxes')
-                fluxes = {i:[] for i in range(len(aperture_diameters))}
-                fluxes_random = {i:[] for i in range(len(aperture_diameters))}
-
-                for tile in tqdm.tqdm(tiles):
-
-                    image_files = images_config.get_image_files(filt, tile)
-
-                    if homogenized: 
-                        sci_path = image_files.get_homogenized_path(psfs_config.target_filter)
-                        with fits.open(sci_path) as sci_hdul:
-                            sci = sci_hdul[0].data
-                            header = sci_hdul[0].header
-                    else:
-                        sci_path = image_files.get_science_path()
-                        with fits.open(sci_path) as sci_hdul:
-                            sci = sci_hdul[0].data
-                            header = sci_hdul[0].header
-
-                    if image_files.has_extension('rms'):
-                        rms_path = image_files.get_rms_path()
-                        logger.debug(f"Using rms image -> {rms_path.name}")
-                        with fits.open(rms_path) as hdul:
-                            rms = hdul[0].data
-                    else: 
-                        wht_path = image_files.get_weight_path()
-                        logger.debug(f"No rms image found, using wht image -> {wht_path.name}")
-                        with fits.open(wht_path) as hdul:
-                            with warnings.catch_warnings():
-                                warnings.simplefilter('ignore', category=RuntimeWarning)
-                                rms = 1/np.sqrt(hdul[0].data)
-                    
-                    sci = sci.astype(sci.dtype.newbyteorder('='))
-                    rms = rms.astype(rms.dtype.newbyteorder('='))
-
-                    with warnings.catch_warnings():
-                        warnings.simplefilter('ignore', category=RuntimeWarning)
-                        nsci = sci/rms
-
-                    nsci[(rms <= 0)|~np.isfinite(rms)] = np.nan
-
-                    nsci_random = np.random.normal(loc=0, scale=rms1_random, size=nsci.shape)
-
+            logger.info(f'Measuring random aperture scaling for {filt} ({imgtype})')
+            filter_tiles = images_config.get_tiles_for_filter(filt)
+            tasks, kinds, conversions, pixel_scales = [], set(), [], []
+            for n, tile in enumerate(filter_tiles):
+                image_files = images_config.get_image_files(filt, tile)
+                sci_path = image_files.get_homogenized_path(psfs_config.target_filter) if homogenized else image_files.get_science_path()
+                scale_kind, proxy_kind = _resolve_noise_maps(image_files, depth_proxy, scale_map)
+                has_nexp = nexp_groups > 1 and bool(image_files.has_extension('exp'))
+                kinds.add((scale_kind, proxy_kind, has_nexp))
+                header = fits.getheader(sci_path)
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', FITSFixedWarning)
                     pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
+                pixel_scales.append(pixel_scale)
+                conversions.append(get_unit_conversion(header, 'nJy'))
+                segmap_path = images_config.get_tile_segmap_path(tile) if mask_sources else None
+                if mask_sources and (segmap_path is None or not Path(segmap_path).exists()):
+                    logger.warning(f'{filt} {tile}: no segmentation map found, random apertures will not avoid sources')
+                    segmap_path = None
+                positions = None
+                need_emp = scale_kind == 'empirical' or proxy_kind == 'empirical' or (check_weight_map and proxy_kind == 'wht')
+                if need_emp and project_dir is not None:
+                    from .photometry import load_tile_catalog, get_source_positions
+                    cat, windowed = load_tile_catalog(project_dir, project_name, tile)
+                    if cat is not None:
+                        x, y = get_source_positions(cat, windowed)
+                        positions = (np.asarray(cat['id']), np.asarray(x, float), np.asarray(y, float))
+                tasks.append((str(sci_path),
+                              str(image_files.get_rms_path()) if image_files.has_extension('rms') else None,
+                              str(image_files.get_weight_path()) if image_files.has_extension('wht') else None,
+                              str(image_files.get_exp_path()) if has_nexp else None,
+                              str(segmap_path) if segmap_path is not None else None,
+                              scale_kind, proxy_kind, check_weight_map and proxy_kind == 'wht',
+                              aperture_diameters.tolist(), pixel_scale,
+                              num_apertures_per_sq_arcmin, min_num_apertures_per_sq_arcmin, mask_dilate,
+                              1000 * n + 7, positions, 12 if depth_strata > 1 else 0))
+            if len(kinds) != 1:
+                raise ValueError(f'{filt}: the tiles do not have the same map extensions: {kinds}')
+            scale_kind, proxy_kind, has_nexp = kinds.pop()
 
-                    n_valid_pixels = np.sum(np.isfinite(nsci))
-                    if n_valid_pixels == 0:
-                        logger.warning(f'{filt} {tile}: no valid pixels, skipping in random apertures')
-                        continue
-                    area = n_valid_pixels * pixel_scale**2 / 3600
-
-                    x, y = np.arange(np.shape(nsci)[1]), np.arange(np.shape(nsci)[0])
-                    x, y = np.meshgrid(x, y)
-                    x, y = x.flatten(), y.flatten()
-                    x = x[np.isfinite(nsci.flatten())]
-                    y = y[np.isfinite(nsci.flatten())]
-
-                    for i in range(num_radii):
-                        diameter = aperture_diameters[i]
-                        Nap = int(num_apertures_per_sq_arcmin * area)
-                        if diameter > 1.0: 
-                            Nap = int(Nap * 0.25/(diameter/2)**2)
-                        if Nap/area < min_num_apertures_per_sq_arcmin:
-                            Nap = int(min_num_apertures_per_sq_arcmin * area)
-                            
-                        idx = np.random.randint(low=0,high=len(x),size=Nap)
-                        xi, yi = x[idx].astype(float), y[idx].astype(float)
-                        xi += np.random.normal(loc=0, scale=1, size=Nap)
-                        yi += np.random.normal(loc=0, scale=1, size=Nap)
-
-                        apertures = CircularAperture(np.array([xi,yi]).T, r=diameter/2/pixel_scale)
-
-                        tbl = aperture_photometry(nsci, apertures, method='subpixel', subpixels=5)
-                        fluxes[i].extend(list(tbl['aperture_sum']))
-                        
-                        tbl = aperture_photometry(nsci_random, apertures, method='subpixel', subpixels=5)
-                        fluxes_random[i].extend(list(tbl['aperture_sum']))
-                
-                logger.info('Fitting distribution')
-                rmsN = np.zeros(num_radii)
-                rmsN_err = np.zeros(num_radii)
-                
-                rmsN_random = np.zeros(num_radii)
-                rmsN_err_random = np.zeros(num_radii)
-
-                for i in tqdm.tqdm(range(num_radii)):
-                    f = np.array(fluxes[i])
-                    _, std, _, std_err = fit_pixel_dist(f, sigma_upper=1.0, maxiters=3, return_err=True)
-                    rmsN[i] = std
-                    rmsN_err[i] = std_err
-                    
-                    rmsN_random[i] = np.nanstd(np.array(fluxes_random[i]))
-                    rmsN_err_random[i] = 0
-
-                logger.info('Fitting curve')        
-                N = np.pi*(aperture_diameters/2/pixel_scale)**2
-                sqrtN = np.sqrt(N)
-                conversion = get_unit_conversion(header, 'nJy')
-
-                # First compute the simple power law method
-                def func(sqrtN, alpha, beta):
-                    return alpha*np.power(sqrtN, beta)
-                popt, pcov = curve_fit(func, sqrtN, rmsN/rms1, p0=[1,1], maxfev=int(1e5))
-                plaw = lambda x: func(x, *popt)
-                
-                # Then do the spline method
-                x_all = np.append([0,1], sqrtN)
-                y_all = np.append([0,1], rmsN/rms1)
-                w_all = np.append([500,100], rms1/rmsN_err)
-
-                bspline = make_splrep(
-                    x = x_all, 
-                    y = y_all, 
-                    w = w_all, 
-                    k = 3, 
-                    s = len(x_all)
-                )
-
-                results = {
-                    'sigma1': float(rms1 * conversion),
-                    'sqrtN': sqrtN,
-                    'rmsN/rms1': rmsN/rms1,
-                    'rmsN_err/rms1': rmsN_err/rms1,
-                    'rmsN_random/rms1': rmsN_random/rms1_random,
-                    'rmsN_err_random/rms1': rmsN_err_random/rms1_random,
-                    'pixel_scale': pixel_scale,
-                    'spline': {
-                        'c': list(bspline.c.astype(float)),
-                        't': list(bspline.t.astype(float)),
-                        'k': int(bspline.k),
-                    },
-                    'plaw': {
-                        'alpha': float(popt[0]),
-                        'beta': float(popt[1]),
-                    },
-                    'sqrtN_max': float(np.max(sqrtN)),
-                }
-
-                with open(output_file, 'wb') as pickle_file:
-                    pickle.dump(results, pickle_file)
-                logger.info(f'Saving results to {output_file}')
-
+            if parallel > 1 and len(tasks) > 1:
+                import multiprocessing as mp
+                with mp.get_context('fork').Pool(min(parallel, len(tasks))) as pool:
+                    results = pool.map(_sample_tile_task, tasks)
             else:
-                logger.info(f'Skipping random aperture measurement for {filt} ({imgtype})')
+                results = []
+                for tile, task in zip(filter_tiles, tqdm.tqdm(tasks)):
+                    results.append(_sample_tile_task(task))
+            results = [(tile, r) for tile, r in zip(filter_tiles, results) if r['n_valid'] > 0]
+            if not results:
+                raise ValueError(f'{filt}: no valid pixels in any tile for random apertures')
+            for tile, r in results:
+                logger.debug(f'{filt} {tile}: {r["area_arcmin2"]:.2f} arcmin^2, {len(r["f"][0])} apertures at the smallest radius')
 
-            plot_file = output_file.with_suffix('.pdf')
-            if not plot_file.exists() or overwrite: 
-                with open(output_file, 'rb') as pickle_file:
-                    results = pickle.load(pickle_file)
+            # single-pixel width of image/scale (= 1 for a perfect scale map)
+            pixels = np.concatenate([r['pixels'] for _, r in results])
+            _, rms1 = fit_pixel_dist(pixels, sigma_upper=1.0, maxiters=5)
 
-                sqrtN = results['sqrtN']
-                N = sqrtN**2
-                pixel_scale = results['pixel_scale']
+            # weight-map check: fall back to the empirical proxy if the weight map does not order depth
+            checks = [r['wht_check'] for _, r in results if r.get('wht_check')]
+            wht_check = None
+            proxy_used = proxy_kind
+            if checks:
+                wht_check = {'spearman': float(np.median([c['spearman'] for c in checks])),
+                             'slope': float(np.median([c['slope'] for c in checks])),
+                             'scatter_dex': float(np.median([c['scatter_dex'] for c in checks])),
+                             'n_tiles_ok': int(sum(c['ok'] for c in checks)), 'n_tiles': len(checks)}
+                logger.info(f'{filt}: weight map vs empirical noise: slope {wht_check["slope"]:.2f}, Spearman {wht_check["spearman"]:.2f}, '
+                            f'scatter {wht_check["scatter_dex"]:.3f} dex ({wht_check["n_tiles_ok"]}/{wht_check["n_tiles"]} tiles pass)')
+                if wht_check['n_tiles_ok'] < 0.5 * wht_check['n_tiles'] and all('empirical' in r['logp'] for _, r in results):
+                    logger.warning(f'{filt}: the weight map does not track the empirical noise; using the empirical '
+                                   f'noise map as the depth proxy instead')
+                    proxy_used = 'empirical'
 
-                import matplotlib.pyplot as plt
-                fig, ax = plt.subplots(figsize=(3.5,3), constrained_layout=True)
-                
-                ax.errorbar(sqrtN, results['rmsN/rms1'], yerr=results['rmsN_err/rms1'],
-                    linewidth=0, marker='s', mfc='none', mec='k', 
-                    mew=0.8, ms=5, elinewidth=0.6, ecolor='k', 
-                    capsize=1.5, capthick=0.6, zorder=1000)
-                x = np.linspace(0, 1.1*np.max(sqrtN), 1000)
-                
+            samples = {i: {'f': np.concatenate([r['f'][i] for _, r in results]),
+                           'logp': np.concatenate([r['logp'][proxy_used][i] for _, r in results])}
+                       for i in range(num_radii)}
+            if has_nexp:
+                for i in range(num_radii):
+                    samples[i]['lognexp'] = np.concatenate([r['logp']['nexp'][i] for _, r in results])
+            pixel_scale = float(np.median(pixel_scales))
+            sqrtN = np.sqrt(np.pi) * aperture_diameters / 2 / pixel_scale
+            logger.info(f'{filt}: fitting {depth_strata} depth strata'
+                        + (f' and up to {nexp_groups} exposure-count groups x {nexp_strata} strata' if has_nexp else '')
+                        + f' on {sum(len(s["f"]) for s in samples.values())} apertures')
+            fit_kw = dict(k_groups=nexp_groups if has_nexp else 1, k_per_group=nexp_strata)
+            # validation fit (holdout_fraction of the apertures kept back), then the production fit on
+            # every aperture; the catalog uses the latter, the validation table comes from the former
+            validation, vstructure = None, None
+            if holdout_fraction > 0:
+                vfit = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=holdout_fraction, **fit_kw)
+                validation = vfit['validation']
+                # the validation fit may form a different number of strata/groups than the production
+                # fit on all apertures: the validation table is indexed by its own structure
+                vstructure = {'strata_log_centres': vfit['strata']['log_centres'], 'strata_n': vfit['strata']['n'],
+                              'group_log_centres': vfit['groups']['log_centres'], 'group_n': vfit['groups']['n'],
+                              'cells': [{'log_centres': m['log_centres'], 'n': m['n']} for m in vfit['groups']['members']]}
+            model = nc.fit_model(samples, sqrtN, rms1, depth_strata, holdout_fraction=0.0, **fit_kw)
+            if validation is not None:
+                model['validation'] = validation
+                model['validation_structure'] = vstructure
+            model.update({
+                'sigma1': float(rms1 * np.median(conversions)),
+                'rms1': float(rms1),
+                'pixel_scale': pixel_scale,
+                'proxy': proxy_used,
+                'scale': scale_kind,
+                'nexp': has_nexp,
+                'tiles': [tile for tile, _ in results],
+                'n_apertures': [int(len(s['f'])) for s in samples.values()],
+                'wht_check': wht_check,
+                'mask_sources': mask_sources,
+            })
+            with open(pickle_file, 'wb') as f:
+                pickle.dump(model, f)
+            groups = model['groups']
+            with open(validation_file, 'w') as f:
+                json.dump({'filter': filt, 'image': imgtype, 'proxy': proxy_used, 'scale': scale_kind,
+                           'depth_strata_requested': depth_strata, 'strata_edges_logp': model['strata']['edges'],
+                           'strata_log_centres': model['strata']['log_centres'], 'strata_n': model['strata']['n'],
+                           'nexp': has_nexp, 'nexp_groups_requested': nexp_groups if has_nexp else 1,
+                           'group_edges_lognexp': groups['edges'], 'group_log_centres': groups['log_centres'],
+                           'group_n': groups['n'],
+                           'cells': [{'edges_logq': m['edges'], 'log_centres': m['log_centres'], 'n': m['n']} for m in groups['members']],
+                           'diameters_arcsec': aperture_diameters.tolist(), 'sqrtN': sqrtN.tolist(),
+                           'rms1': float(rms1), 'wht_check': wht_check, 'validation': model['validation'],
+                           'validation_structure': model.get('validation_structure')}, f, indent=1)
+            if proxy_used == 'empirical' or scale_kind == 'empirical':
+                parts = [(tile, r['empirical_at_sources']) for tile, r in results if 'empirical_at_sources' in r]
+                if parts:
+                    np.savez_compressed(empirical_file,
+                                        tile=np.concatenate([np.full(len(ids), tile) for tile, (ids, _) in parts]),
+                                        id=np.concatenate([ids for _, (ids, _) in parts]),
+                                        value=np.concatenate([v for _, (_, v) in parts]))
+            v = model['validation']
+            summary = ', '.join(f'{d:.2f}"={w:.2f}' for d, w in zip(aperture_diameters[::max(1, num_radii // 6)], v['overall'][::max(1, num_radii // 6)]) if w is not None)
+            cells = ' x '.join(str(len(m['log_centres'])) for m in groups['members'])
+            logger.info(f'{filt} ({imgtype}): {len(model["strata"]["log_centres"]) or 1} strata'
+                        + (f', {len(groups["log_centres"])} exposure-count groups with {cells} strata' if groups['members'] else '')
+                        + f'; held-out width measured/predicted: {summary}')
+            logger.info(f'Saving results to {pickle_file}')
+            _plot_random_apertures(model, filt, imgtype, plot_file)
 
-                bspline = BSpline(c=results['spline']['c'], t=results['spline']['t'], k=results['spline']['k'])
-                y = bspline(x)
-                ax.plot(x, y, color='b', label='Spline')
 
-                y = results['plaw']['alpha'] * np.power(x, results['plaw']['beta'])
-                ax.plot(x, y, color='m', label='Power law')
-                
-                ax.errorbar(sqrtN, results['rmsN_random/rms1'], yerr=results['rmsN_err_random/rms1'], 
-                    linewidth=0, marker='s', mfc='none', mec='0.7', mew=0.8, ms=5, 
-                    elinewidth=0.6, ecolor='0.7', capsize=1.5, capthick=0.6, zorder=1000)
-                x = np.linspace(0, 1.1*np.max(sqrtN), 1000)
-
-                ax.set_xlim(0, np.max(np.sqrt(N))*1.1)
-                ax.set_ylim(-0.03*np.max(results['rmsN/rms1']), 1.1*np.max(results['rmsN/rms1']))
-                ax.set_xlabel(r'$\sqrt{N_{\rm pix}}$' + f' ({int(pixel_scale*1000)} mas)')
-                ax.set_ylabel(r'$\sigma_N/\sigma_1$')
-
-                ax.legend(loc='upper left', title=filt.upper(), frameon=False)
-
-                ax.annotate('Gaussian random field', (0.95,0.05), 
-                    xycoords='axes fraction', ha='right', va='bottom', color='0.7')
-
-                logger.info(f"Saving plot to {plot_file}")
-                plt.savefig(plot_file)
-                plt.close()
+def _plot_random_apertures(model: dict, filt: str, imgtype: str, plot_file: Path) -> None:
+    """Check plot: the fitted curves per stratum and the held-out calibration."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from ..core import noise_curves as nc
+    sqrtN = np.asarray(model['sqrtN']); pixel_scale = model['pixel_scale']
+    strata = model.get('strata') or {}
+    n_strata = len(strata.get('log_centres', []))
+    groups = model.get('groups') or {}
+    n_groups = len(groups.get('log_centres', []))
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6), constrained_layout=True)
+    ax = axes[0]
+    x = np.linspace(0, 1.1 * np.max(sqrtN), 400)
+    ax.errorbar(sqrtN, model['rmsN/rms1'], yerr=model['rmsN_err/rms1'], fmt='s', mfc='none', mec='k', ms=4, ecolor='k', elinewidth=0.6, label='all apertures')
+    ax.plot(x, nc.evaluate_curve(model, x), color='k', lw=1)
+    if n_groups > 1:
+        # one colour per exposure-count group, one line per cell (depth-per-exposure stratum)
+        colors = plt.cm.viridis(np.linspace(0, 1, n_groups))
+        for g in range(n_groups):
+            for s, c in enumerate(groups['members'][g]['curves']):
+                ax.plot(x, nc.evaluate_curve(c, x), color=colors[g], lw=0.7, alpha=0.8,
+                        label=f'NEXP~{np.exp(groups["log_centres"][g]):.0f} ({len(groups["members"][g]["curves"])} strata)' if s == 0 else None)
+    elif n_strata > 1:
+        colors = plt.cm.viridis(np.linspace(0, 1, n_strata))
+        for s in range(n_strata):
+            ax.plot(x, nc.evaluate_curve(strata['curves'][s], x), color=colors[s], lw=0.8,
+                    label=f'stratum {s} (log p={strata["log_centres"][s]:.2f})' if n_strata <= 6 or s in (0, n_strata - 1) else None)
+    ax.plot(x, x, color='0.6', ls=':', lw=0.8, label='white noise')
+    ax.set_xlabel(r'$\sqrt{N_{\rm pix}}$' + f' ({int(pixel_scale*1000)} mas)'); ax.set_ylabel(r'$\sigma_N/\sigma_1$')
+    ax.set_xlim(0, 1.1 * np.max(sqrtN)); ax.legend(fontsize=6, frameon=False, title=f'{filt} ({imgtype})')
+    ax = axes[1]
+    v = model['validation']
+    diam = 2 * sqrtN / np.sqrt(np.pi) * pixel_scale
+    ax.plot(diam, [np.nan if w is None else w for w in v['overall_single_curve']], 'k--', lw=0.8, label='single curve')
+    if n_groups > 1:
+        ax.plot(diam, [np.nan if w is None else w for w in v.get('overall_strata', [])], 'k:', lw=0.8, label='depth strata only')
+        ax.plot(diam, [np.nan if w is None else w for w in v['overall']], 'k-', lw=1.2, label='NEXP x depth (all)')
+        vg = v.get('by_group', [])
+        for g in range(len(vg)):
+            ax.plot(diam, [np.nan if w is None else w for w in vg[g]], color=colors[min(g, n_groups - 1)], lw=0.7)
+    else:
+        ax.plot(diam, [np.nan if w is None else w for w in v['overall']], 'k-', lw=1.2, label='stratified (all)')
+        vs = v.get('by_stratum', [])
+        if n_strata > 1:
+            for s in range(len(vs)):
+                ax.plot(diam, [np.nan if w is None else w for w in vs[s]], color=colors[min(s, n_strata - 1)], lw=0.7)
+    ax.axhline(1, color='0.5', lw=0.6); ax.set_ylim(0.6, 1.5)
+    ax.set_xlabel('aperture diameter [arcsec]'); ax.set_ylabel('held-out: measured / predicted')
+    ax.legend(fontsize=6, frameon=False)
+    plt.savefig(plot_file, dpi=120)
+    plt.close(fig)
 
 
 def _get_random_aperture_curve(
     sqrtN: np.ndarray,
-    coeff_file: Path
+    coeff_file: Path,
+    log_proxy: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    
+    """sigma_N in nJy per unit of the scale map, for apertures of sqrt(N) pixels at depth proxy
+    log_proxy (None: the single pooled curve)."""
+    from ..core import noise_curves as nc
     with open(coeff_file, 'rb') as f:
-        coeffs = pickle.load(f)
+        model = pickle.load(f)
+    return model['sigma1'] * nc.predict(model, sqrtN, log_proxy)
 
-    sigma1 = coeffs['sigma1']
-    alpha = coeffs['plaw']['alpha']
-    beta = coeffs['plaw']['beta']
-    
-    c = coeffs['spline']['c']
-    t = coeffs['spline']['t']
-    k = coeffs['spline']['k']
-    sqrtN_max = coeffs['sqrtN_max']
 
-    plaw_result = sigma1 * alpha * np.power(sqrtN, beta)
+def _object_noise_inputs(catalog: Table, filt: str, model: dict, empirical_file: Path):
+    """Per-object scale (in image units), log depth proxy and log exposure count for the model's
+    map choices. Returns (scale, log_proxy, log_nexp); log_proxy / log_nexp are None when the
+    model does not use them or the catalog has no column for them (the prediction then falls
+    back to the 1-D strata or the pooled curve)."""
+    logger = get_logger()
+    n = len(catalog)
+    emp = None
 
-    from scipy.interpolate import BSpline
-    bspline = BSpline(c=coeffs['spline']['c'], t=coeffs['spline']['t'], k=coeffs['spline']['k'])
-    spline_result = sigma1 * bspline(sqrtN)
+    def empirical_values():
+        nonlocal emp
+        if emp is None:
+            if not empirical_file.exists():
+                raise ValueError(f'{filt}: the noise model uses the empirical noise map but {empirical_file.name} is missing')
+            z = np.load(empirical_file, allow_pickle=False)
+            lookup = {(str(t), int(i)): v for t, i, v in zip(z['tile'], z['id'], z['value'])}
+            tiles = np.asarray(catalog['tile']).astype(str) if 'tile' in catalog.colnames else np.full(n, str(z['tile'][0]))
+            ids = np.asarray(catalog['id_tile']) if 'id_tile' in catalog.colnames else np.asarray(catalog['id'])
+            emp = np.array([lookup.get((t, int(i)), np.nan) for t, i in zip(tiles, ids)], float)
+        return emp
 
-    result = np.where(sqrtN<0.85*sqrtN_max, spline_result, plaw_result)
-    return result
+    def column(kind):
+        if kind == 'rms' and f'rms_{filt}' in catalog.colnames:
+            return np.asarray(catalog[f'rms_{filt}'], float)
+        if kind == 'wht' and f'wht_{filt}' in catalog.colnames:
+            return np.asarray(catalog[f'wht_{filt}'], float)
+        if kind == 'empirical':
+            return empirical_values()
+        return None
+
+    scale_kind, proxy_kind = model.get('scale', 'rms'), model.get('proxy')
+    scale = column(scale_kind)
+    if scale is None:
+        raise ValueError(f"{filt}: catalog has no column for the noise scale '{scale_kind}'")
+    if scale_kind == 'wht':
+        with np.errstate(divide='ignore', invalid='ignore'):
+            scale = 1.0 / np.sqrt(np.maximum(scale, 1e-30))
+    log_proxy = None
+    if proxy_kind is not None and model.get('strata', {}).get('log_centres'):
+        p = column(proxy_kind)
+        if p is None:
+            logger.warning(f"{filt}: catalog has no column for the depth proxy '{proxy_kind}'; using the single pooled curve")
+        else:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                log_proxy = np.where(p > 0, np.log(p), np.nan)
+    log_nexp = None
+    if log_proxy is not None and len(model.get('groups', {}).get('log_centres', [])) > 1:
+        if f'nexp_{filt}' in catalog.colnames:
+            e = np.asarray(catalog[f'nexp_{filt}'], float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                log_nexp = np.where(e > 0, np.log(e), np.nan)
+        else:
+            logger.warning(f"{filt}: catalog has no nexp_{filt} column (photometry run without the exp extension); "
+                           f"using the depth strata without exposure-count groups")
+    return scale, log_proxy, log_nexp
+
 
 def calibrate_flux_uncertainties(
     catalog: Table,
     random_aperture_dir: Path,
     filters: List[str],
     psfs_config,
-    aperture_diameters, 
+    aperture_diameters,
     flux_unit,
 ) -> Table:
     """
-    Apply uncertainty calibration using random aperture measurements.
-    
-    Args:
-        catalog: Master catalog table
-        random_aperture_dir: Directory containing random aperture files
-        tiles: List of tiles
-        filters: List of filters
-        
-    Returns:
-        Catalog with calibrated uncertainties
-        
-    Implementation notes for user:
-    - Load random aperture measurements for all tiles/filters
-    - For each aperture diameter in catalog:
-      - Find corresponding random aperture measurements
-      - Calculate empirical scatter vs theoretical errors
-      - Fit scaling relations (e.g., scatter = a * theoretical_error + b)
-      - Apply corrections to catalog flux errors
-    - Update error columns with calibrated values
-    - Add metadata about calibration (scaling factors, RMS, etc.)
+    Replace the measured flux errors by the random-aperture model: for every object,
+    sigma = sigma1 * c(sqrt N, depth proxy) * scale(x), where N is the number of pixels actually
+    summed (npix_* columns written by photometry; the Kron ellipse area / aperture area if they
+    are missing) and the multiplicative corrections applied to the fluxes (kron_corr,
+    inverse-filter factors, aper_corr) are applied to the errors as well. The measured errors
+    are kept as e_*_uncal.
     """
     logger = get_logger()
+    from ..core import noise_curves as nc
     logger.info("Calibrating uncertainties using random aperture measurements")
-    
+    filters = _filters_to_apply(catalog, 'uncertainty_calibration', filters)
+    models_used = set()
+
+    def model_for(filt, homogenized):
+        use_native = psfs_config is None or filt == psfs_config.target_filter or filt in psfs_config.inverse_filters
+        pickle_file, _, empirical_file, _ = _random_aperture_products(random_aperture_dir, filt, homogenized and not use_native)
+        with open(pickle_file, 'rb') as f:
+            model = pickle.load(f)
+        if 'strata' not in model:     # coefficients written by the single-curve code
+            model['strata'] = {}; model.setdefault('scale', 'rms'); model.setdefault('proxy', None)
+        return model, empirical_file
+
+    def to_unit(values):
+        return (values * u.nJy).to(flux_unit).value
+
     for filt in filters:
         logger.info(f'Applying random aperture calibration for {filt}')
 
-        # pixel_scale = self.images.get(filter=filt)[0].pixel_scale
-        # err = self.objects[f'err_{filt}']
-
-        if f'rms_{filt}' in catalog.columns:
-            rms = catalog[f'rms_{filt}']
-        else:
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', category=RuntimeWarning)
-                rms = 1/np.sqrt(np.maximum(catalog[f'wht_{filt}'], 1e-10))
-
-        # auto (kron) photometry
+        # auto (kron) photometry: PSF-homogenized image unless target/inverse filter
         if f'f_auto_{filt}' in catalog.columns:
-            sqrtN_kron = np.sqrt(catalog['kron1_area'])
-            
-            coeff_file = random_aperture_dir / f'random_apertures_{filt}_psfhom_coeffs.pickle'
-            if psfs_config is not None: 
-                if filt == psfs_config.target_filter or filt in psfs_config.inverse_filters:
-                    coeff_file = random_aperture_dir / f'random_apertures_{filt}_coeffs.pickle'
-
-            result = _get_random_aperture_curve(sqrtN_kron, coeff_file)
-            rmsN = result * rms
-            rmsN = (rmsN*u.nJy).to(flux_unit).value
-
-            catalog.rename_column(f'e_auto_{filt}', f'e_auto_{filt}_uncal')
+            model, empirical_file = model_for(filt, True)
+            scale, log_proxy, log_nexp = _object_noise_inputs(catalog, filt, model, empirical_file)
+            if f'npix_auto_{filt}' in catalog.columns:
+                sqrtN = np.sqrt(np.maximum(np.asarray(catalog[f'npix_auto_{filt}'], float), 1.0))
+            else:
+                sqrtN = np.sqrt(np.asarray(catalog['kron1_area'], float))
+            rmsN = to_unit(model['sigma1'] * nc.predict(model, sqrtN, log_proxy, log_nexp) * scale)
+            if f'e_auto_{filt}_uncal' not in catalog.columns:
+                catalog.rename_column(f'e_auto_{filt}', f'e_auto_{filt}_uncal')
             catalog[f'e_auto_{filt}'] = np.where(np.isfinite(catalog[f'e_auto_{filt}_uncal']), rmsN, np.nan)
-            
-            if psfs_config is not None:
-                if filt in psfs_config.inverse_filters:
-                    catalog[f'e_auto_{filt}'] *= catalog[f'psf_corr_auto_{filt}']
+            if psfs_config is not None and filt in psfs_config.inverse_filters and f'psf_corr_auto_{filt}' in catalog.columns:
+                catalog[f'e_auto_{filt}'] *= catalog[f'psf_corr_auto_{filt}']
+            if 'kron_corr' in catalog.columns:
+                catalog[f'e_auto_{filt}'] *= catalog['kron_corr']
+            models_used.add((model.get('scale'), model.get('proxy'), len(model['strata'].get('log_centres', [])) or 1,
+                             len(model.get('groups', {}).get('log_centres', [])) if log_nexp is not None else 0))
 
-            catalog[f'e_auto_{filt}'] *= catalog[f'kron_corr']
-
-        if f'f_aper_nat_{filt}' in catalog.columns:
-            # native resolution aperture photometry
-            coeff_file = random_aperture_dir / f'random_apertures_{filt}_coeffs.pickle'
-            with open(coeff_file, 'rb') as f:
-                coeffs = pickle.load(f)
-            pixel_scale = coeffs['pixel_scale']
-            
-            sqrtN_aper = np.sqrt(np.pi)*np.array(aperture_diameters)/pixel_scale/2
-
-            result = _get_random_aperture_curve(sqrtN_aper, coeff_file)
-            rmsN = np.outer(rms, result)
-            rmsN = (rmsN*u.nJy).to(flux_unit).value
-
-            catalog.rename_column(f'e_aper_nat_{filt}', f'e_aper_nat_{filt}_uncal')
-            catalog[f'e_aper_nat_{filt}'] = np.where(np.isfinite(catalog[f'e_aper_nat_{filt}_uncal']), rmsN, np.nan)
-
-        
-        if f'f_aper_hom_{filt}' in catalog.columns:
-            # psf-homogenized aperture photometry
-            coeff_file = random_aperture_dir / f'random_apertures_{filt}_psfhom_coeffs.pickle'
-            if psfs_config is not None: 
-                if filt == psfs_config.target_filter or filt in psfs_config.inverse_filters:
-                    coeff_file = random_aperture_dir / f'random_apertures_{filt}_coeffs.pickle'
-
-            with open(coeff_file, 'rb') as f:
-                coeffs = pickle.load(f)
-            pixel_scale = coeffs['pixel_scale']
-            
-            sqrtN_aper = np.sqrt(np.pi)*np.array(aperture_diameters)/pixel_scale/2
-
-            result = _get_random_aperture_curve(sqrtN_aper, coeff_file)
-            rmsN = np.outer(rms, result)
-            rmsN = (rmsN*u.nJy).to(flux_unit).value
-
-            catalog.rename_column(f'e_aper_hom_{filt}', f'e_aper_hom_{filt}_uncal')
-            catalog[f'e_aper_hom_{filt}'] = np.where(np.isfinite(catalog[f'e_aper_hom_{filt}_uncal']), rmsN, np.nan)
-
-            if psfs_config is not None:
-                if filt in psfs_config.inverse_filters:
+        for phot_type, homogenized in (('aper_nat', False), ('aper_hom', True)):
+            if f'f_{phot_type}_{filt}' not in catalog.columns:
+                continue
+            model, empirical_file = model_for(filt, homogenized)
+            scale, log_proxy, log_nexp = _object_noise_inputs(catalog, filt, model, empirical_file)
+            pixel_scale = model['pixel_scale']
+            n_diam = len(aperture_diameters)
+            if f'npix_{phot_type}_{filt}' in catalog.columns:
+                npix = np.maximum(np.asarray(catalog[f'npix_{phot_type}_{filt}'], float), 1.0)
+            else:
+                npix = np.broadcast_to(np.pi * (np.asarray(aperture_diameters) / pixel_scale / 2) ** 2, (len(catalog), n_diam))
+            rmsN = np.empty((len(catalog), n_diam))
+            for j in range(n_diam):
+                rmsN[:, j] = model['sigma1'] * nc.predict(model, np.sqrt(npix[:, j]), log_proxy, log_nexp) * scale
+            rmsN = to_unit(rmsN)
+            if f'e_{phot_type}_{filt}_uncal' not in catalog.columns:
+                catalog.rename_column(f'e_{phot_type}_{filt}', f'e_{phot_type}_{filt}_uncal')
+            catalog[f'e_{phot_type}_{filt}'] = np.where(np.isfinite(catalog[f'e_{phot_type}_{filt}_uncal']), rmsN, np.nan)
+            if phot_type == 'aper_hom':
+                if psfs_config is not None and filt in psfs_config.inverse_filters and f'psf_corr_aper_{filt}' in catalog.columns:
                     catalog[f'e_aper_hom_{filt}'] *= catalog[f'psf_corr_aper_{filt}']
+                if 'aper_corr' in catalog.columns:
+                    catalog[f'e_aper_hom_{filt}'] *= catalog['aper_corr']
 
-            # Only present when aperture correction was enabled in photometry
-            if 'aper_corr' in catalog.columns:
-                catalog[f'e_aper_hom_{filt}'] *= catalog['aper_corr']
-
+    if models_used:
+        catalog.meta['NOISEMOD'] = '; '.join(f'scale={s} proxy={p} strata={k}' + (f' nexp_groups={g}' if g else '')
+                                             for s, p, k, g in sorted(models_used, key=str))
+    _record_applied(catalog, STEP_STATE_KEYS['uncertainty_calibration'], filters)
     return catalog
 
 
@@ -743,10 +885,39 @@ def _compute_psf_corr_grid(psf_path, output_file):
     return output_file
 
 
+# Header keywords of the merged catalog recording which filters each postprocess step has
+# already been applied to (comma-separated lists). Each step is applied once per merged
+# catalog; `postprocess --overwrite` rebuilds the merge from the tile catalogs and so resets
+# them. (Review finding F14: a second `postprocess` run re-applied the PSF grid, x1.126.)
+STEP_STATE_KEYS = {'psf_corrections': 'PSFCORR', 'uncertainty_calibration': 'ERRCAL',
+                   'extinction_correction': 'EXTCORR'}
+
+
+def _applied_filters(catalog: Table, key: str) -> set:
+    return {f for f in str(catalog.meta.get(key, '')).split(',') if f}
+
+
+def _record_applied(catalog: Table, key: str, filters) -> None:
+    catalog.meta[key] = ','.join(sorted(_applied_filters(catalog, key) | set(filters)))
+
+
+def _filters_to_apply(catalog: Table, step: str, filters: List[str]) -> List[str]:
+    """Drop the filters a step has already been applied to in this merged catalog."""
+    logger = get_logger()
+    done = _applied_filters(catalog, STEP_STATE_KEYS[step])
+    skipped = [f for f in filters if f in done]
+    if skipped:
+        logger.warning(f"{step}: already applied to {len(skipped)} filter(s) of this merged catalog "
+                       f"({', '.join(skipped[:6])}{', ...' if len(skipped) > 6 else ''}); skipping them. "
+                       f"Run `postprocess --overwrite` to rebuild the merged catalog from the tile "
+                       f"catalogs and apply every step once.")
+    return [f for f in filters if f not in done]
+
+
 def apply_psf_corrections(
     catalog: Table,
     psf_correction_dir: Path,
-    tiles: List[str], 
+    tiles: List[str],
     filters: List[str],
     psfs_config,
     aperture_diameters: List[float]
@@ -765,31 +936,28 @@ def apply_psf_corrections(
     """
     logger = get_logger()
 
+    # Every filter is corrected with the TARGET filter's aperture-to-total grid. Homogenized
+    # filters are measured on images convolved to the target PSF; inverse filters (broader PSF
+    # than the target) are measured on their native image and then scaled at photometry time by
+    # the per-source factor flux(target, native) / flux(target, convolved to this filter), which
+    # already brings them to the target resolution. Using the inverse filter's own grid here
+    # applied that correction a second time (F17 in the 2026-10 review: F770W fluxes +15%).
+    target = psfs_config.target_filter
+    filters = _filters_to_apply(catalog, 'psf_corrections', filters)
     for filt in filters:
         logger.info(filt)
-        if filt in psfs_config.inverse_filters:
-            if psfs_config.master_psf:
-                logger.debug(f'{filt} - master PSF')
-                psf_corr_file = psf_correction_dir / f'{filt}_psf_corr_grid.txt'
-                catalog = _apply_psf_corr(catalog, filt, 'all', psf_corr_file, aperture_diameters)
-            else:
-                logger.debug(f'{filt} - per-tile PSF')
-                for tile in tiles:
-                    logger.debug(f'{filt} - {tile}')
-                    psf_corr_file = psf_correction_dir / f'{filt}_{tile}_psf_corr_grid.txt'
-                    catalog = _apply_psf_corr(catalog, filt, tile, psf_corr_file, aperture_diameters)
+        if psfs_config.master_psf:
+            logger.debug(f'{filt} - master PSF ({target} grid)')
+            psf_corr_file = psf_correction_dir / f'{target}_psf_corr_grid.txt'
+            catalog = _apply_psf_corr(catalog, filt, 'all', psf_corr_file, aperture_diameters)
         else:
-            if psfs_config.master_psf:
-                logger.debug(f'{filt} - master PSF')
-                psf_corr_file = psf_correction_dir / f'{psfs_config.target_filter}_psf_corr_grid.txt'
-                catalog = _apply_psf_corr(catalog, filt, 'all', psf_corr_file, aperture_diameters)
-            else:
-                logger.debug(f'{filt} - per-tile PSF')
-                for tile in tiles:
-                    logger.debug(f'{filt} - {tile}')
-                    psf_corr_file = psf_correction_dir / f'{psfs_config.target_filter}_{tile}_psf_corr_grid.txt'
-                    catalog = _apply_psf_corr(catalog, filt, tile, psf_corr_file, aperture_diameters)
+            logger.debug(f'{filt} - per-tile PSF ({target} grids)')
+            for tile in tiles:
+                logger.debug(f'{filt} - {tile}')
+                psf_corr_file = psf_correction_dir / f'{target}_{tile}_psf_corr_grid.txt'
+                catalog = _apply_psf_corr(catalog, filt, tile, psf_corr_file, aperture_diameters)
 
+    _record_applied(catalog, STEP_STATE_KEYS['psf_corrections'], filters)
     return catalog
 
 
@@ -831,7 +999,14 @@ def set_missing_to_nan(catalog, filters):
 
         for phot_type in ['auto','aper_nat','aper_hom']:
             if f'f_{phot_type}_{filt}' in catalog.columns:
-                cond = ~np.isfinite(catalog[f'f_{phot_type}_{filt}']) | (catalog[f'f_{phot_type}_{filt}'] == 0) | ~np.isfinite(catalog[f'e_{phot_type}_{filt}_uncal']) | (catalog[f'e_{phot_type}_{filt}_uncal'] == 0)
+                f = catalog[f'f_{phot_type}_{filt}']
+                e_uncal = catalog[f'e_{phot_type}_{filt}_uncal']
+                cond = ~np.isfinite(f) | (f == 0) | ~np.isfinite(e_uncal) | (e_uncal == 0)
+                # A calibrated error that is not finite or not positive marks an entry whose
+                # correction factors were undefined or negative (F01): no usable measurement.
+                e = catalog[f'e_{phot_type}_{filt}']
+                with np.errstate(invalid='ignore'):
+                    cond |= ~np.isfinite(e) | (e <= 0)
                 catalog[f'f_{phot_type}_{filt}'][cond] = np.nan
                 catalog[f'e_{phot_type}_{filt}'][cond] = np.nan
                 catalog[f'e_{phot_type}_{filt}_uncal'][cond] = np.nan
@@ -912,7 +1087,8 @@ def apply_galactic_extinction_corr(
     """
     logger = get_logger()
     logger.info(f"Applying galactic extinction correction using {reddening_map_file.name}")
-    
+    filters = _filters_to_apply(catalog, 'extinction_correction', filters)
+
     # Load dust map
     with fits.open(reddening_map_file) as hdul:
         ebv_map = hdul[0].data
@@ -990,7 +1166,8 @@ def apply_galactic_extinction_corr(
     logger.info(f"Extinction correction applied to {n_corrected} columns")
     logger.info(f"  Median A_V = {np.median(Av_sources):.3f} mag")
     logger.info(f"  A_V range: [{np.min(Av_sources):.3f}, {np.max(Av_sources):.3f}] mag")
-    
+
+    _record_applied(catalog, STEP_STATE_KEYS['extinction_correction'], filters)
     return catalog
 
 
@@ -1053,12 +1230,18 @@ def apply_galactic_extinction_corr(
     help="Run only for a subset of filters (comma-separated)"
 )
 @click.option(
+    "--parallel",
+    type=int,
+    default=0,
+    help="Tiles sampled in parallel for the random apertures (default: config value)"
+)
+@click.option(
     "--verbose", "-v",
     is_flag=True,
     help="Enable debug output"
 )
 def postprocess_cmd(
-    project_dir, 
+    project_dir,
     overwrite,
     merge_only,
     random_apertures_only,
@@ -1069,6 +1252,7 @@ def postprocess_cmd(
     skip_psf_corrections,
     skip_extinction_correction,
     filters,
+    parallel,
     verbose
 ):
     """
@@ -1223,7 +1407,19 @@ def postprocess_cmd(
                     num_radii=postprocess_config.random_apertures.num_radii,
                     num_apertures_per_sq_arcmin=postprocess_config.random_apertures.num_apertures_per_sq_arcmin,
                     output_dir=output_dirs['random_apertures'],
-                    overwrite=overwrite
+                    overwrite=overwrite,
+                    depth_strata=postprocess_config.random_apertures.depth_strata,
+                    depth_proxy=postprocess_config.random_apertures.depth_proxy,
+                    scale_map=postprocess_config.random_apertures.scale_map,
+                    mask_sources=postprocess_config.random_apertures.mask_sources,
+                    mask_dilate=postprocess_config.random_apertures.mask_dilate,
+                    holdout_fraction=postprocess_config.random_apertures.holdout_fraction,
+                    check_weight_map=postprocess_config.random_apertures.check_weight_map,
+                    nexp_groups=postprocess_config.random_apertures.nexp_groups,
+                    nexp_strata=postprocess_config.random_apertures.nexp_strata,
+                    parallel=parallel or postprocess_config.random_apertures.parallel,
+                    project_dir=project_dir,
+                    project_name=config.name,
                 )
                 logger.info("Random aperture measurements completed")
                 

@@ -17,7 +17,7 @@ from astropy.wcs import WCS
 from ..core.catalog import find_catalog_in_directory
 from ..core.logging import get_logger
 from ..config.parser import load_config
-from ..config.images import load_images_config, load_segmentation_map, ImagesConfig, ImageFiles
+from ..config.images import load_images_config, load_segmentation_map, ImagesConfig, ImageFiles, EXP_NEXP_HDU
 from ..config.psfs import load_psfs_config, PSFsConfig
 from ..config.schema import PhotometryConfig, AperateConfig
 from ..utils.helpers import get_unit_conversion
@@ -25,7 +25,6 @@ from ..utils.helpers import get_unit_conversion
 from astropy.wcs import FITSFixedWarning
 warnings.simplefilter('ignore', category=FITSFixedWarning)
 
-from photutils.aperture import CircularAperture, ApertureStats
 import sep
 
 @dataclass
@@ -47,15 +46,23 @@ class PhotometryContext:
     overwrite: bool
     _image_cache: Dict[str, np.ndarray] = field(default_factory=dict, repr=False)
     _flux_cache: Dict[str, object] = field(default_factory=dict, repr=False)
+    _persistent: set = field(default_factory=set, repr=False)
 
-    def load_image(self, path, hdu_index=0) -> np.ndarray:
-        """Load a FITS image with byteorder conversion, caching by path."""
-        key = str(path)
+    def load_image(self, path, hdu_index=0, persistent=False) -> np.ndarray:
+        """Load a FITS image with byteorder conversion, caching by path and HDU.
+
+        persistent=True keeps the array across clear_image_cache() calls; used for images that
+        every filter needs again (the target filter's native image for the inverse-filter
+        corrections), so a tile reads them once instead of once per filter (F10).
+        """
+        key = f'{path}#{hdu_index}'
         if key not in self._image_cache:
             with fits.open(path) as hdul:
                 data = hdul[hdu_index].data
                 data = data.astype(data.dtype.newbyteorder('='))
             self._image_cache[key] = data
+        if persistent:
+            self._persistent.add(key)
         return self._image_cache[key]
 
     def load_error(self, image_files) -> np.ndarray:
@@ -74,9 +81,21 @@ class PhotometryContext:
         else:
             return None
 
-    def clear_image_cache(self):
-        """Free cached image arrays."""
-        self._image_cache.clear()
+    def ones_image(self, shape) -> np.ndarray:
+        """A persistent float32 image of ones (for counting the pixels sep sums)."""
+        key = f'ones#{shape[0]}x{shape[1]}'
+        if key not in self._image_cache:
+            self._image_cache[key] = np.ones(shape, dtype=np.float32)
+            self._persistent.add(key)
+        return self._image_cache[key]
+
+    def clear_image_cache(self, all=False):
+        """Free cached image arrays (except the persistent ones unless all=True)."""
+        for key in list(self._image_cache):
+            if all or key not in self._persistent:
+                del self._image_cache[key]
+        if all:
+            self._persistent.clear()
 
     def get_image_files(self, filter_name: str) -> Optional[ImageFiles]:
         """Get image files for any filter in the current tile.
@@ -106,6 +125,53 @@ class PhotometryContext:
         return get_logger()
 
 
+# Primary-header keywords recording which filters' columns carry each multiplicative
+# correction (comma-separated filter lists). They make partial reruns safe: see
+# _apply_multiplicative_correction (review finding F03).
+CORRECTION_STATE_KEYS = {'KRONCORR': 'kron_corr', 'APERCORR': 'aper_corr'}
+
+
+def _mark_raw(catalog: Table, meta_key: str, filter_name: str) -> None:
+    """Record that filter_name's columns have just been (re)measured and are uncorrected."""
+    applied = [f for f in catalog.meta.get(meta_key, []) if f != filter_name]
+    catalog.meta[meta_key] = applied
+
+
+def _apply_multiplicative_correction(catalog: Table, column_prefixes, new_corr, old_corr, meta_key: str):
+    """Multiply the per-filter columns by new_corr so that the result does not depend on how
+    many times, or for which subset of filters, photometry has been run.
+
+    column_prefixes: e.g. ('f_auto_', 'e_auto_'); every column starting with the first prefix
+        defines a filter (the part after the prefix).
+    new_corr: correction to apply (shape broadcastable to the columns).
+    old_corr: the correction column stored by the previous run (None if there was none).
+    meta_key: catalog.meta entry listing the filters whose columns were corrected by the
+        previous run. Those columns are divided by old_corr first (entries where old_corr is
+        not finite or zero become NaN), so a rerun of `photometry --filters <subset>` never
+        multiplies an untouched filter twice (review finding F03: F277W x1.64 after an
+        F444W-only rerun in cosmos_v1.3). Filters re-measured in this run were removed from
+        the list by _mark_raw. Returns the list of filters now corrected.
+    """
+    applied = set(catalog.meta.get(meta_key, []))
+    first = column_prefixes[0]
+    filters = [c[len(first):] for c in catalog.colnames if c.startswith(first)]
+    for filt in filters:
+        for prefix in column_prefixes:
+            col = f'{prefix}{filt}'
+            if col not in catalog.colnames:
+                continue
+            values = np.asarray(catalog[col], dtype=float)
+            if filt in applied:
+                if old_corr is None:
+                    raise ValueError(f'{col} is recorded as corrected but the previous {meta_key} column is missing')
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    ok = np.isfinite(old_corr) & (old_corr != 0)
+                    values = np.where(ok, values / np.where(ok, old_corr, 1.0), np.nan)
+            catalog[col] = values * new_corr
+    catalog.meta[meta_key] = filters
+    return filters
+
+
 def load_tile_catalog(project_dir: Path, project_name: str, tile: str) -> Tuple[Optional[Table], bool]:
     """
     Load detection catalog for a specific tile.
@@ -129,6 +195,18 @@ def load_tile_catalog(project_dir: Path, project_name: str, tile: str) -> Tuple[
             catalog = Table(hdul['SOURCES'].data)
             # Get windowed flag from metadata, default to False for backward compatibility
             windowed = bool(hdul[0].header.get('WINDOWED', False))
+            # Which filters already carry the multiplicative corrections (see
+            # _apply_multiplicative_correction); comma-separated lists in the primary header.
+            for key, corr_col in CORRECTION_STATE_KEYS.items():
+                if key in hdul[0].header:
+                    catalog.meta[key] = [f for f in str(hdul[0].header[key]).split(',') if f]
+                elif corr_col in catalog.colnames:
+                    # Catalog written before the state keywords existed: a stored correction
+                    # column means a full run applied it to every filter present.
+                    prefix = 'f_auto_' if key == 'KRONCORR' else 'f_aper_hom_'
+                    catalog.meta[key] = [c[len(prefix):] for c in catalog.colnames if c.startswith(prefix)]
+                else:
+                    catalog.meta[key] = []
         logger.debug(f"    Loaded catalog from {catalog_path} (windowed={windowed})")
         return catalog, windowed
     except Exception as e:
@@ -201,7 +279,10 @@ def save_tile_catalog(project_dir: Path, project_name: str, tile: str, catalog: 
         # Load existing FITS file to preserve header information
         with fits.open(catalog_path) as hdul:
             primary_hdu = hdul[0].copy()  # Preserve primary header
-        
+        for key in CORRECTION_STATE_KEYS:
+            applied = catalog.meta.get(key, [])
+            primary_hdu.header[key] = (','.join(applied), 'filters with this correction applied')
+
         # Create new table HDU with updated catalog
         table_hdu = fits.BinTableHDU(catalog, name='SOURCES')
         
@@ -215,48 +296,69 @@ def save_tile_catalog(project_dir: Path, project_name: str, tile: str, catalog: 
         raise
 
 
-def compute_weights(catalog: Table, image_files, filter_name: str, windowed: bool) -> Table:
+def _local_median(image: np.ndarray, x_pos, y_pos, r: float = 5.0, chunk: int = 200000, stat: str = 'median') -> np.ndarray:
+    """Median (or mean, stat='mean') of the finite pixels whose centres lie within r pixels of
+    each position.
+
+    Vectorised gather over the (2r+1)^2 offsets, in chunks of sources; equivalent to the
+    per-source cutout median of photutils.ApertureStats but ~100x faster (F10).
     """
-    Compute median weight values at source positions.
-    
-    Extracts the median value of the weight map at the position of each source
-    and stores it in a new column named 'weight_{filter_name}'.
-    Uses windowed positions (xwin, ywin) if windowed=True, otherwise uses (x, y).
-    
-    Args:
-        catalog: Source catalog table
-        image_files: ImageFiles object containing file paths
-        filter_name: Filter name for column naming
-        windowed: Whether to use windowed positions
-        
-    Returns:
-        Updated catalog with weight column
+    reduce = np.nanmedian if stat == 'median' else np.nanmean
+    ri = int(np.ceil(r))
+    dy, dx = np.mgrid[-ri:ri + 1, -ri:ri + 1]
+    inside = (dx ** 2 + dy ** 2) <= r ** 2
+    dx, dy = dx[inside], dy[inside]
+    ny, nx = image.shape
+    xi = np.round(np.asarray(x_pos, dtype=float)).astype(int)
+    yi = np.round(np.asarray(y_pos, dtype=float)).astype(int)
+    out = np.full(len(xi), np.nan)
+    for s in range(0, len(xi), chunk):
+        xx = xi[s:s + chunk, None] + dx[None, :]
+        yy = yi[s:s + chunk, None] + dy[None, :]
+        ok = (xx >= 0) & (xx < nx) & (yy >= 0) & (yy < ny)
+        vals = np.full(xx.shape, np.nan)
+        vals[ok] = image[yy[ok], xx[ok]]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            out[s:s + chunk] = reduce(vals, axis=1)
+    return out
+
+
+def compute_weights(ctx: PhotometryContext, filter_name: str, image_files) -> Table:
     """
-    logger = get_logger()
-    logger.debug(f"        Computing weights for {filter_name} (windowed={windowed})")
-    
-    # Get source positions using helper function
-    x_pos, y_pos = get_source_positions(catalog, windowed)
-    
+    Compute the local weight and rms values at source positions.
+
+    Stores the median of the weight map (and of the rms map, when present) within r = 5 px of
+    each source in 'wht_{filter_name}' / 'rms_{filter_name}'; these are the per-object scale of
+    the error model applied in postprocess. The median is computed with a vectorised gather
+    instead of photutils.ApertureStats (20-30 s per filter and tile before, F10), and the maps
+    go through the context cache so that the error map derived from the weight map does not
+    read the file a second time.
+    """
+    logger = ctx.get_logger()
+    logger.debug(f"        Computing weights for {filter_name} (windowed={ctx.windowed})")
+    x_pos, y_pos = get_source_positions(ctx.catalog, ctx.windowed)
+
     if image_files.has_extension('wht'):
-        wht_path = image_files.get_weight_path()
-        with fits.open(wht_path) as hdul:
-            aperture = CircularAperture(np.array([x_pos, y_pos]).T, r=5)
-            aperstats = ApertureStats(hdul[0].data, aperture)
-            catalog[f'wht_{filter_name}'] = aperstats.median
+        wht = ctx.load_image(image_files.get_weight_path())
+        ctx.catalog[f'wht_{filter_name}'] = _local_median(wht, x_pos, y_pos)
     else:
         logger.warning(f"        Could not find weight map for {filter_name}")
-    
+
     if image_files.has_extension('rms'):
-        rms_path = image_files.get_rms_path()
-        with fits.open(rms_path) as hdul:
-            aperture = CircularAperture(np.array([x_pos, y_pos]).T, r=5)
-            aperstats = ApertureStats(hdul[0].data, aperture)
-            catalog[f'rms_{filter_name}'] = aperstats.median
+        rms = ctx.load_image(image_files.get_rms_path())
+        ctx.catalog[f'rms_{filter_name}'] = _local_median(rms, x_pos, y_pos)
     else:
         logger.warning(f"        Could not find rms map for {filter_name}")
-    
-    return catalog
+
+    if image_files.has_extension('exp'):
+        # number of exposures: the NEXP plane of the exposure map (its first image HDU is the
+        # exposure time), as the local mean (fractional near exposure edges), the same
+        # definition as the random apertures use (noise_curves.PROXY_RADIUS)
+        nexp = ctx.load_image(image_files.get_exp_path(), hdu_index=EXP_NEXP_HDU)
+        ctx.catalog[f'nexp_{filter_name}'] = _local_median(nexp, x_pos, y_pos, stat='mean').astype(np.float32)
+
+    return ctx.catalog
 
 def compute_rhalf(ctx: PhotometryContext, filter_name: str, image_files) -> Table:
     """
@@ -382,6 +484,14 @@ def compute_aper_photometry(
     flux = np.column_stack(flux_list)
     fluxerr = np.column_stack(fluxerr_list)
 
+    # Number of pixels actually summed (invalid pixels and other segments excluded): the
+    # aperture size the error model uses (postprocess)
+    ones = ctx.ones_image(sci.shape)
+    npix = np.column_stack([
+        sep.sum_circle(ones, x_pos, y_pos, diam_pix / 2, mask=mask, segmap=ctx.segmap, seg_id=ctx.catalog['id'])[0]
+        for diam_pix in aperture_diameters_pixels])
+    ctx.catalog[f"npix_aper_{'hom' if homogenized else 'nat'}_{filter_name}"] = np.round(npix).astype(np.int32)
+
     # Cache raw (pre-unit-conversion) aperture fluxes for aper_corr reuse
     if homogenized and ctx.photometry_config.aperture.aper_corr:
         aper_corr_filter = ctx.photometry_config.aperture.aper_corr_filter
@@ -403,7 +513,7 @@ def compute_aper_photometry(
 
             if target_hom_path and target_hom_path.exists():
                 hom_data = ctx.load_image(target_hom_path)
-                sci_data = ctx.load_image(target_sci_path)
+                sci_data = ctx.load_image(target_sci_path, persistent=True)
                 corr_mask = ~np.isfinite(hom_data)
 
                 flux1_list = []
@@ -426,8 +536,15 @@ def compute_aper_photometry(
                 flux1 = np.column_stack(flux1_list)
                 flux2 = np.column_stack(flux2_list)
 
-                # Correction factor for flux lost due to larger PSF
-                corr_fact = flux2 / flux1
+                # Correction factor for flux lost due to larger PSF. As in the AUTO path: the
+                # ratio is positive by definition, so take abs() (a negative value, from a
+                # noise-dominated flux1 or flux2, would flip the sign of flux and error) and
+                # leave the flux unchanged where the ratio is undefined. (F01; the factor
+                # itself remains a ratio of noisy fluxes for faint sources -- review F09.)
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)
+                    corr_fact = np.abs(flux2 / flux1)
+                corr_fact = np.where(np.isfinite(corr_fact), corr_fact, 1.0)
                 flux *= corr_fact
                 fluxerr *= corr_fact
 
@@ -451,6 +568,8 @@ def compute_aper_photometry(
     col_suffix = 'hom' if homogenized else 'nat'
     ctx.catalog[f'f_aper_{col_suffix}_{filter_name}'] = flux
     ctx.catalog[f'e_aper_{col_suffix}_{filter_name}'] = fluxerr
+    if homogenized:
+        _mark_raw(ctx.catalog, 'APERCORR', filter_name)
     
     logger.debug(f"        Added columns {f'f_aper_{col_suffix}_{filter_name}'}, {f'e_aper_{col_suffix}_{filter_name}'}")
 
@@ -472,10 +591,14 @@ def _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params):
         seg_id=ids
     )
 
+    # semi-axes of the Kron ellipse actually summed above, in pixels
     a = kron_params[0]*kronrad*a
     b = kron_params[0]*kronrad*b
 
-    use_circle = kron_params[0] * kronrad * np.sqrt(a * b) < kron_params[1]
+    # Minimum-circle rule: ellipses whose geometric-mean radius falls below the minimum radius
+    # kron_params[1] (pixels) are replaced by a circle of that radius.  a and b are already
+    # scaled by kron_params[0]*kronrad, so the factor must not be applied again (F20).
+    use_circle = np.sqrt(a * b) < kron_params[1]
 
     cflux, cfluxerr, cflag = sep.sum_circle(
         sci, 
@@ -549,6 +672,10 @@ def compute_auto_photometry(
 
     # Run the auto photometry calculation
     flux, fluxerr, flag, a, b = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
+    # Number of pixels actually summed in the Kron aperture (same mask and segment exclusion):
+    # the aperture size the error model uses (postprocess)
+    npix, _, _, _, _ = _compute_auto_photometry(ctx.ones_image(sci.shape), None, mask, x_pos, y_pos, ctx, kron_params)
+    ctx.catalog[f'npix_auto_{filter_name}'] = np.round(npix).astype(np.int32)
 
     # Cache raw (pre-unit-conversion) auto flux for kron_corr and aper_corr reuse
     # Use filter-specific keys since kron_corr_filter and aper_corr_filter may differ
@@ -580,7 +707,7 @@ def compute_auto_photometry(
 
             if target_hom_path and target_hom_path.exists():
                 hom_data = ctx.load_image(target_hom_path)
-                sci_data = ctx.load_image(target_sci_path)
+                sci_data = ctx.load_image(target_sci_path, persistent=True)
                 corr_mask = ~np.isfinite(hom_data)
 
                 flux1, _, _, _, _ = _compute_auto_photometry(
@@ -619,6 +746,7 @@ def compute_auto_photometry(
     # Add results to catalog (store aperture fluxes as 2D array with columns = aperture sizes)
     ctx.catalog[f'f_auto_{filter_name}'] = flux
     ctx.catalog[f'e_auto_{filter_name}'] = fluxerr
+    _mark_raw(ctx.catalog, 'KRONCORR', filter_name)
 
     logger.debug(f"        Added columns {f'f_auto_{filter_name}'}, {f'e_auto_{filter_name}'}")
     return ctx.catalog
@@ -727,13 +855,12 @@ def apply_kron_corr(
     # Flag sources that hit the upper bound (likely blended)
     flag_blend = (kron_corr == kron_corr_bounds[1])
     
-    # Apply correction to all AUTO photometry columns
-    n_corrected = 0
-    for col in ctx.catalog.colnames:
-        if col.startswith('f_auto_') or col.startswith('e_auto_'):
-            ctx.catalog[col] *= kron_corr
-            n_corrected += 1
-    
+    # Apply correction to all AUTO photometry columns (idempotently: columns corrected by a
+    # previous run are first divided by that run's kron_corr, F03)
+    old_corr = np.asarray(ctx.catalog['kron_corr'], dtype=float) if 'kron_corr' in ctx.catalog.colnames else None
+    corrected = _apply_multiplicative_correction(ctx.catalog, ('f_auto_', 'e_auto_'), kron_corr, old_corr, 'KRONCORR')
+    n_corrected = 2 * len(corrected)
+
     # Store correction information in catalog
     ctx.catalog['kron_corr'] = kron_corr
     ctx.catalog['flag_blend'] = flag_blend
@@ -753,18 +880,48 @@ def apply_kron_corr(
     logger.info(f"  Correction range: [{np.min(kron_corr):.3f}, {np.max(kron_corr):.3f}]")
 
 
+def _finalize_aper_corr(aper_corr, snr, bounds, min_snr):
+    """Gate and bound the per-source aperture corrections (review finding F01).
+
+    aper_corr: (n_src, n_diam) ratio AUTO / fixed-aperture flux on the correction image
+    snr:       (n_src, n_diam) S/N of the fixed-aperture flux that forms the denominator
+    Returns (aper_corr, flag) where flag is an int16 array with bit 1 set where the ratio was
+    not applied (denominator below min_snr, or undefined -> aper_corr NaN) and bit 2 where it
+    lies outside bounds (flagged, not clipped: the plausible range depends strongly on the
+    aperture diameter -- on the review cutout the 5-95% range is 15-190 at 0.05" and 0.8-1.8
+    at 1.0" -- so one pair of bounds cannot be a clip for all diameters). The S/N gate is what
+    removes the noise-dominated ratios: in cosmos_v1.3 the ungated ratio was negative for
+    0.7-2.8% of entries, sign-flipping flux and error.
+    """
+    aper_corr = np.array(aper_corr, dtype=float)
+    snr = np.asarray(snr, dtype=float)
+    flag = np.zeros(aper_corr.shape, dtype=np.int16)
+    with np.errstate(invalid='ignore'):
+        low = ~np.isfinite(aper_corr) | ~np.isfinite(snr) | (snr < min_snr)
+        out = np.isfinite(aper_corr) & ((aper_corr < bounds[0]) | (aper_corr > bounds[1]))
+    flag[low] |= 1
+    flag[out & ~low] |= 2
+    aper_corr[low] = np.nan
+    return aper_corr, flag
+
+
 def apply_aper_corr(
     ctx: PhotometryContext,
     aper_corr_filter: str,
     kron_params: List[float],
     aper_corr_bounds: List[float],
-    aperture_diameters: List[float]
+    aperture_diameters: List[float],
+    aper_corr_min_snr: float = 3.0,
 ) -> None:
     """
     Apply aperture correction to PSF-homogenized aperture photometry measurements.
-    
+
     Computes aperture photometry and Kron photometry on the same image and uses the flux ratio
-    to correct for flux missed in fixed apertures.
+    to correct for flux missed in fixed apertures. The correction is applied only where the
+    fixed-aperture flux on the correction image has S/N >= aper_corr_min_snr (otherwise the
+    corrected flux and error are NaN); values outside aper_corr_bounds are flagged but kept.
+    Both cases are recorded in the 'flag_aper_corr' column (bit 1: not applied, bit 2: outside
+    bounds).
     """
     logger = ctx.get_logger()
     logger.info(f"Applying aperture correction using {aper_corr_filter}")
@@ -786,18 +943,23 @@ def apply_aper_corr(
 
         logger.debug(f"Using detection image: {det_path}")
         sci = ctx.load_image(det_path, hdu_index=1)
-        mask = ~np.isfinite(sci)
-        err = None
-
-        # Get pixel scale from header
+        # The detection image carries its error map in HDU 2 (see detect.py); it gives the
+        # S/N of the fixed-aperture flux that the correction divides by.
         with fits.open(det_path) as det_hdul:
             header = det_hdul[1].header
             pixel_scale = WCS(header).proj_plane_pixel_scales()[0].to('arcsec').value
+            has_err = len(det_hdul) > 2 and det_hdul[2].data is not None
+        err = ctx.load_image(det_path, hdu_index=2) if has_err else None
+        if err is None:
+            logger.warning("Detection image has no error HDU: aperture-correction S/N gate disabled")
+        mask = ~np.isfinite(sci)
+        if err is not None:
+            mask |= ~np.isfinite(err)
 
         # Convert aperture diameters from arcsec to pixels
         aperture_diameters_pixels = np.array(aperture_diameters) / pixel_scale
 
-        flux_list = []
+        flux_list, fluxerr_list = [], []
         for diam_pix in aperture_diameters_pixels:
             flux_i, fluxerr_i, flag = sep.sum_circle(
                 sci, x_pos, y_pos,
@@ -808,9 +970,11 @@ def apply_aper_corr(
                 seg_id=ctx.catalog['id'],
             )
             flux_list.append(flux_i)
+            fluxerr_list.append(fluxerr_i)
 
         flux1 = np.column_stack(flux_list)
-        flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
+        fluxerr1 = np.column_stack(fluxerr_list) if err is not None else None
+        flux2, _, _, a2, b2 = _compute_auto_photometry(sci, None, mask, x_pos, y_pos, ctx, kron_params)
 
     else:
         # Reuse fluxes cached by the main photometry pass where they are valid:
@@ -876,27 +1040,46 @@ def apply_aper_corr(
             # AUTO flux with the aperture-correction Kron parameters (not auto.kron_params)
             flux2, _, _, a2, b2 = _compute_auto_photometry(sci, err, mask, x_pos, y_pos, ctx, kron_params)
 
-    # Calculate correction factor
-    aper_corr = flux2[:, np.newaxis] / flux1
-    
-    # Apply bounds to correction factor
-    # aper_corr = np.clip(aper_corr, aper_corr_bounds[0], aper_corr_bounds[1])
-    
-    # Apply correction to all APER_HOM photometry columns
-    n_corrected = 0
-    for col in ctx.catalog.colnames:
-        if col.startswith('f_aper_hom_') or col.startswith('e_aper_hom_'):
-            ctx.catalog[col] *= aper_corr
-            n_corrected += 1
-    
+        fluxerr1 = None
+
+    # S/N of the denominator (fixed-aperture flux on the correction image)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        if fluxerr1 is not None:
+            snr1 = flux1 / fluxerr1
+        elif (f'f_aper_hom_{aper_corr_filter}' in ctx.catalog.colnames
+              and f'e_aper_hom_{aper_corr_filter}' in ctx.catalog.colnames):
+            # same apertures on the same image, already in catalog units
+            snr1 = np.asarray(ctx.catalog[f'f_aper_hom_{aper_corr_filter}']) / np.asarray(ctx.catalog[f'e_aper_hom_{aper_corr_filter}'])
+        else:
+            logger.warning("No error available for the aperture-correction denominator: S/N gate disabled")
+            snr1 = np.full(flux1.shape, np.inf)
+
+        # Calculate correction factor
+        aper_corr = flux2[:, np.newaxis] / flux1
+
+    # Gate on S/N, apply bounds, flag (F01)
+    aper_corr, flag_aper_corr = _finalize_aper_corr(aper_corr, snr1, aper_corr_bounds, aper_corr_min_snr)
+
+    # Apply correction to all APER_HOM photometry columns (idempotently, see F03 above)
+    old_corr = np.asarray(ctx.catalog['aper_corr'], dtype=float) if 'aper_corr' in ctx.catalog.colnames else None
+    corrected = _apply_multiplicative_correction(ctx.catalog, ('f_aper_hom_', 'e_aper_hom_'), aper_corr, old_corr, 'APERCORR')
+    n_corrected = 2 * len(corrected)
+
     # Store correction information in catalog
     ctx.catalog['aper_corr'] = aper_corr
-    
+    ctx.catalog['flag_aper_corr'] = flag_aper_corr
+
     # Log summary statistics
     median_corr = np.nanmedian(aper_corr)
     isnan = np.sum(np.isnan(aper_corr))
-    # n_at_bound = np.sum(aper_corr == aper_corr_bounds[1])
+    frac_low = np.mean(flag_aper_corr & 1, axis=0)
+    frac_out = np.mean((flag_aper_corr & 2) > 0, axis=0)
     logger.info(f"Aperture correction applied to {n_corrected} columns")
+    logger.info("  Not applied (S/N < %.1f) per diameter: %s", aper_corr_min_snr,
+                ', '.join(f'{d}"={100*f:.1f}%' for d, f in zip(aperture_diameters, frac_low)))
+    logger.info("  Flagged outside bounds %s per diameter: %s", list(aper_corr_bounds),
+                ', '.join(f'{d}"={100*f:.1f}%' for d, f in zip(aperture_diameters, frac_out)))
     logger.info(f"  Median correction: {median_corr:.3f}")
     logger.info(f"  Percent nan: {isnan/aper_corr.size*100:.1f}%")
     # logger.info(f"  Sources at upper bound: {n_at_bound}/{len(aper_corr)} ({100*n_at_bound/len(aper_corr):.1f}%)")
@@ -929,7 +1112,7 @@ def process_photometry_for_filter(ctx: PhotometryContext, filter_name: str) -> T
         logger.debug(f"        Filter {filter_name}: is_target={ctx.is_target_filter(filter_name)}, is_inverse={ctx.is_inverse_filter(filter_name)}")
     
     # Always compute weights and RMS (basic measurements)
-    ctx.catalog = compute_weights(ctx.catalog, image_files, filter_name, ctx.windowed)
+    ctx.catalog = compute_weights(ctx, filter_name, image_files)
     # note: removed compute_rms as its included within compute_weights now
     
     # Compute half-light radii if requested
@@ -1036,7 +1219,8 @@ def process_photometry_tile(project_dir, tile, filters_to_process, config, image
                 ctx.photometry_config.aperture.aper_corr_filter,
                 ctx.photometry_config.aperture.aper_corr_params,
                 ctx.photometry_config.aperture.aper_corr_bounds,
-                ctx.photometry_config.aperture.diameters
+                ctx.photometry_config.aperture.diameters,
+                ctx.photometry_config.aperture.aper_corr_min_snr,
             )
         
         # Save updated catalog
