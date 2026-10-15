@@ -101,3 +101,13 @@ def test_messages_use_toml_paths():
     with pytest.raises(ValueError) as exc:
         AperateConfig.from_dict(d)
     assert 'steps.photometry.aperture.diameters' in str(exc.value)
+
+
+def test_shipped_example_config_is_valid():
+    """aperate/example_config.toml must validate against the schema (it documents the keys)."""
+    from pathlib import Path
+    import aperate
+    from aperate.config.parser import load_config
+    cfg = load_config(Path(aperate.__file__).parent / 'example_config.toml')
+    assert cfg.detection.source_detection.scheme == 'hot+cold'
+    assert cfg.postprocess.random_apertures.nexp_groups == 5
