@@ -55,6 +55,75 @@ def distance_to_nearest_edge(x, y, image_width, image_height):
         return min(left_edge_dist, right_edge_dist, top_edge_dist, bottom_edge_dist)
 
 
+def _take_meta(catalog: Table) -> dict:
+    """Detach a tile catalog's metadata before it enters a merge and return it.
+
+    A FITS header read into Table.meta turns repeated cards (KRONCORR/APERCORR written as
+    one card per filter, COMMENT, HISTORY) into lists, and astropy's vstack concatenates list
+    values of every input. Merging tiles one at a time with the running catalog among the
+    inputs therefore doubles such lists at every step (2^19 x 38 cards for 20 cosmos tiles:
+    80 GB of header and a write that never finished). The merge keeps the pieces free of
+    metadata and writes one summary (_merged_meta) at the end, so growth is bounded by the
+    number of distinct values whatever keys future tile catalogs carry.
+    """
+    from .photometry import CORRECTION_STATE_KEYS
+    meta = {k: (list(v) if isinstance(v, (list, tuple)) else v) for k, v in catalog.meta.items()}
+    # the filters whose columns the tile has, per correction: what its record should list
+    meta['_corr_columns'] = {key: {c[len(prefix):] for c in catalog.colnames if c.startswith(prefix)}
+                             for key, prefix in zip(CORRECTION_STATE_KEYS, ('f_auto_', 'f_aper_hom_'))}
+    catalog.meta = {}
+    return meta
+
+
+def _merged_meta(tile_meta: Dict[str, dict]) -> dict:
+    """One record per key for the merged catalog, from the per-tile metadata.
+
+    Correction-state keys (KRONCORR/APERCORR, the filters whose columns carry the kron and
+    aperture corrections) become the comma-separated list used in the tile primary headers,
+    as the union over tiles; a tile that has a filter's columns without recording the
+    correction for it is reported with a warning, since the merged rows then mix corrected
+    and uncorrected values of that filter (tiles may legitimately cover different filters).
+    Other list values
+    (COMMENT/HISTORY) are deduplicated in order; scalar values are kept when every tile that
+    has them agrees and otherwise dropped with a warning. TILES/NTILES record the provenance.
+    """
+    from .photometry import CORRECTION_STATE_KEYS
+    logger = get_logger()
+    out = {}
+    columns = {t: m.pop('_corr_columns', {}) for t, m in tile_meta.items()}
+    keys = []
+    for m in tile_meta.values():
+        keys += [k for k in m if k not in keys]
+    for key in keys:
+        present = {t: m[key] for t, m in tile_meta.items() if key in m}
+        if key in CORRECTION_STATE_KEYS:
+            sets = {t: set(v if isinstance(v, list) else [f for f in str(v).split(',') if f]) for t, v in present.items()}
+            differ = {t: sorted(columns[t].get(key, set()) - sets.get(t, set())) for t in tile_meta}
+            differ = {t: d for t, d in differ.items() if d}
+            if differ:
+                detail = '; '.join(f'{t}: {", ".join(d)}' for t, d in differ.items())
+                logger.warning(f'{key}: some tiles have columns of filters without the correction recorded ({detail}); '
+                               f'their rows mix corrected and uncorrected values; the merged catalog records the union')
+            order = []
+            for v in present.values():
+                order += [f for f in (v if isinstance(v, list) else str(v).split(',')) if f and f not in order]
+            out[key] = ','.join(order)
+        elif any(isinstance(v, list) for v in present.values()):
+            seen = []
+            for v in present.values():
+                seen += [x for x in (v if isinstance(v, list) else [v]) if x not in seen]
+            out[key] = seen
+        else:
+            values = {repr(v) for v in present.values()}
+            if len(values) == 1:
+                out[key] = next(iter(present.values()))
+            else:
+                logger.warning(f'{key}: the tile catalogs carry different values ({len(values)} distinct); not recorded in the merged catalog')
+    out['TILES'] = ','.join(tile_meta)
+    out['NTILES'] = len(tile_meta)
+    return out
+
+
 def merge_tile_catalogs(
     project_dir: Path,
     project_name: str,
@@ -113,6 +182,7 @@ def merge_tile_catalogs(
     tile0 = tiles[0]
     catalog0_path = project_dir / "catalogs" / f"catalog_{project_name}_{tile0}.fits"
     catalog0 = Table.read(catalog0_path)
+    tile_meta = {tile0: _take_meta(catalog0)}
     catalog0['tile'] = tile0
     catalog0['id_tile'] = catalog0['id']
 
@@ -131,6 +201,7 @@ def merge_tile_catalogs(
     for tile1 in tiles[1:]:
         catalog1_path = project_dir / "catalogs" / f"catalog_{project_name}_{tile1}.fits"
         catalog1 = Table.read(catalog1_path)
+        tile_meta[tile1] = _take_meta(catalog1)
         catalog1['tile'] = tile1
         catalog1['id_tile'] = catalog1['id']
 
@@ -178,6 +249,7 @@ def merge_tile_catalogs(
     
     # Reassign IDs
     catalog_merged['id'] = np.arange(len(catalog_merged)).astype(int)
+    catalog_merged.meta = _merged_meta(tile_meta)
     
     catalog_merged.write(output_path, overwrite=True)
     
